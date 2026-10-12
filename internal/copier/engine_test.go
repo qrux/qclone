@@ -226,8 +226,8 @@ func TestErrorsGoToTheFileNotStderr(t *testing.T) {
 	p, _ := plan.Resolve([]string{src + "/", dst})
 	e := New(p, o)
 	// An unreadable region at 2 MiB, as a dying drive returns: EIO every time.
-	e.readFault = func(show string, off int64) error {
-		if show == "bad-sector.bin" && off >= 2<<20 {
+	e.readFault = func(show string, off int64, n int) error {
+		if show == "bad-sector.bin" && off+int64(n) > 2<<20 {
 			return syscall.EIO
 		}
 		return nil
@@ -250,7 +250,7 @@ func TestErrorsGoToTheFileNotStderr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"locked.txt", "permission denied", "bad-sector.bin", "input/output error (3 tries)", "named pipe", "# command: tclone", "# stopped"} {
+	for _, want := range []string{"locked.txt", "permission denied", "bad-sector.bin", "unreadable: ", "1048576 bytes", "kept for the next run", "named pipe", "# command: tclone", "# stopped"} {
 		if !bytes.Contains(log, []byte(want)) {
 			t.Errorf("error file lacks %q:\n%s", want, log)
 		}
@@ -261,31 +261,67 @@ func TestErrorsGoToTheFileNotStderr(t *testing.T) {
 	if s.Retries < 2 {
 		t.Errorf("retries = %d, want the bad chunk retried", s.Retries)
 	}
-	noPartials(t, dst)
+	if s.BadBytes != 1<<20 || s.BadFiles != 1 {
+		t.Errorf("bad bytes %d in %d files; want the last 1 MiB of one file", s.BadBytes, s.BadFiles)
+	}
+	// The readable 2 MiB are kept for the next run.
+	if n := partials(dst); n != 2 {
+		t.Errorf("%d .tclone- files kept; want the part and its map", n)
+	}
 }
 
-func TestCancelCleansUp(t *testing.T) {
+func partials(dst string) int {
+	n := 0
+	filepath.WalkDir(dst, func(p string, d fs.DirEntry, err error) error {
+		if d != nil && strings.HasPrefix(d.Name(), ".tclone-") {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+// Ctrl-C keeps what was copied of a file in flight, and the next run carries
+// on from there instead of reading it all again.
+func TestCancelKeepsProgressAndResumes(t *testing.T) {
 	base := t.TempDir()
 	src := filepath.Join(base, "s")
-	makeTree(t, src, []spec{{"old/slow.bin", 4 << 20, 0}})
+	makeTree(t, src, []spec{{"old/slow.bin", 24 << 20, 0}})
 	dst := filepath.Join(base, "d")
 	o := opts(filepath.Join(base, "e.txt"))
 	o.Sim = sim.NewDevice(sim.Degraded()) // "old/" is slow: about 0.6 MB/s per read
 	p, _ := plan.Resolve([]string{src + "/", dst})
 	e := New(p, o)
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { time.Sleep(700 * time.Millisecond); cancel() }()
+	go func() { time.Sleep(2 * time.Second); cancel() }()
 	e.Run(ctx)
 	s := e.Snapshot()
-	if !s.Canceled {
-		t.Fatal("not marked canceled")
+	if !s.Canceled || s.Errors != 0 {
+		t.Fatalf("canceled %v errors %d (%s)", s.Canceled, s.Errors, s.LastError)
 	}
 	if _, err := os.Stat(filepath.Join(dst, "old", "slow.bin")); err == nil {
 		t.Fatal("canceled file was installed")
 	}
-	if s.Errors != 0 {
-		t.Fatalf("cancel logged %d errors: %s", s.Errors, s.LastError)
+	if n := partials(dst); n != 2 {
+		t.Fatalf("%d .tclone- files after cancel; want the part and its map", n)
 	}
+	first := e.readBytes.Load()
+
+	o2 := opts(filepath.Join(base, "e2.txt"))
+	o2.Sim = sim.NewDevice(sim.Degraded())
+	e2 := New(p, o2)
+	e2.Run(context.Background())
+	s2 := e2.Snapshot()
+	if s2.FilesDone != 1 || s2.Errors != 0 {
+		t.Fatalf("rerun: done %d errors %d (%s)", s2.FilesDone, s2.Errors, s2.LastError)
+	}
+	if s2.BytesResumed == 0 || s2.BytesResumed > first {
+		t.Fatalf("resumed %d bytes; the first run read %d", s2.BytesResumed, first)
+	}
+	if got := e2.readBytes.Load(); got+s2.BytesResumed != 24<<20 {
+		t.Fatalf("rerun read %d + resumed %d, want exactly the file's %d", got, s2.BytesResumed, 24<<20)
+	}
+	sameTree(t, src, dst)
 	noPartials(t, dst)
 }
 
@@ -368,7 +404,7 @@ func TestRerunRetriesUnderReadOnlyDirectory(t *testing.T) {
 	o := opts(filepath.Join(base, "e1.txt"))
 	p, _ := plan.Resolve([]string{src + "/", dst})
 	e := New(p, o)
-	e.readFault = func(show string, off int64) error {
+	e.readFault = func(show string, off int64, n int) error {
 		if strings.HasSuffix(show, "flaky.bin") {
 			return syscall.EIO
 		}
@@ -396,7 +432,7 @@ func TestCancelDuringRetryIsNotAnError(t *testing.T) {
 	o.Retries = 50
 	p, _ := plan.Resolve([]string{src + "/", dst})
 	e := New(p, o)
-	e.readFault = func(string, int64) error { return syscall.EIO }
+	e.readFault = func(string, int64, int) error { return syscall.EIO }
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(600 * time.Millisecond); cancel() }()
 	e.Run(ctx)
@@ -434,7 +470,7 @@ func TestReusesLeftoverPartial(t *testing.T) {
 	dst := filepath.Join(base, "d")
 	os.MkdirAll(dst, 0o755)
 	e := New(&plan.Plan{Dst: dst}, opts(filepath.Join(base, "x.txt")))
-	stale := e.claimTmp(filepath.Join(dst, "a.bin"))
+	stale, _ := e.claimTmp(filepath.Join(dst, "a.bin"))
 	os.WriteFile(stale, []byte("old partial"), 0o600)
 	run(t, []string{src + "/", dst}, opts(filepath.Join(base, "e.txt")))
 	sameTree(t, src, dst)

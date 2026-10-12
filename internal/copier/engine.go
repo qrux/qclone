@@ -46,6 +46,7 @@ type Options struct {
 	Retries      int           // read attempts per chunk
 	Errors       *ErrorLog
 	Sim          *sim.Device // pretend the source is this drive
+	Rescue       bool        // install files with unreadable ranges, zeros there
 }
 
 // Active is one file in flight.
@@ -65,7 +66,7 @@ type DeviceView struct {
 	Rates   devstat.Rates
 	OK      bool          // rates are from two good samples
 	Idle    bool          // the disk did nothing tclone cares about for the whole history kept
-	Window  time.Duration // what the rates are averaged over
+	Window  time.Duration // what the rates are averaged over; when Idle, how long it has been idle
 	Errors  uint64        // read+write errors since tclone started
 	Retries uint64
 }
@@ -89,6 +90,10 @@ type Snapshot struct {
 	ErrorFile                                        string
 	LastError                                        string
 	Retries                                          int64
+	BytesResumed                                     int64 // carried over from earlier runs' partial files
+	BytesZeroed                                      int64 // zeros written for unreadable ranges (--rescue)
+	BadRanges, BadBytes, BadFiles, FilesRescued      int64 // unreadable ranges found, and files installed with zeros
+	Rescue                                           bool
 	Done, Canceled                                   bool
 }
 
@@ -111,6 +116,19 @@ type file struct {
 	failErr  error
 	failed   atomic.Bool
 	canceled atomic.Bool
+
+	// Rescue (rescue.go). base is the part's name without ".part" when it can
+	// be resumed: the plain claim, not a numbered one.
+	base     string
+	patch    ranges // set when re-reading the zero-filled ranges of a rescued file
+	resuming bool   // the part already holds doneSet from an earlier run
+	rangeMu  sync.Mutex
+	doneSet  ranges
+	badSet   ranges
+	dirty    bool
+	ioMu     sync.Mutex // guards sf, df and closed against the map flusher
+	closed   bool
+	flushed  time.Time
 }
 
 func (f *file) fail(op string, err error) {
@@ -179,6 +197,8 @@ type Engine struct {
 	links, dirsSeen                                  atomic.Int64
 	bytesTotal, bytesDone, bytesSkipped, bytesFailed atomic.Int64
 	readBytes, retries                               atomic.Int64
+	bytesResumed, bytesZeroed, filesRescued          atomic.Int64
+	badRanges, badBytes, badFiles                    atomic.Int64
 	scanning, dispatchIdle, dispatchDone             atomic.Bool
 	canceled, done                                   atomic.Bool
 
@@ -196,7 +216,7 @@ type Engine struct {
 	devs    []*devWatch
 	srcDev  *devWatch // the one source disk, when there is exactly one
 
-	readFault func(show string, off int64) error // tests only
+	readFault func(show string, off int64, n int) error // tests only
 }
 
 // New prepares a run.
@@ -324,10 +344,25 @@ func (e *Engine) Run(ctx context.Context) error {
 		defer close(ctlDone)
 		e.control(stop)
 	}()
+	flushDone := make(chan struct{})
+	go func() {
+		defer close(flushDone)
+		tick := time.NewTicker(flushEvery / 4)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case now := <-tick.C:
+				e.flushMaps(now)
+			}
+		}
+	}()
 	wg.Wait()
 	<-e.scanEnd // nothing may log after Run returns
 	close(stop)
 	<-ctlDone
+	<-flushDone
 	if parent.Err() != nil {
 		e.canceled.Store(true)
 	} else {
@@ -371,12 +406,15 @@ func (e *Engine) scan(ctx context.Context) {
 				}
 			}
 			size := en.Info.Size()
-			if fi, err := os.Lstat(en.Dst); err == nil && fi.Mode().IsRegular() && fi.Size() == size && near(fi.ModTime(), en.Info.ModTime(), e.opt.ModifyWindow) {
-				e.filesSkipped.Add(1)
-				e.bytesSkipped.Add(size)
-				return true
-			}
 			f := &file{show: en.Show, src: en.Src, dst: en.Dst, size: size, mode: m, mtime: en.Info.ModTime()}
+			if fi, err := os.Lstat(en.Dst); err == nil && fi.Mode().IsRegular() && fi.Size() == size && near(fi.ModTime(), en.Info.ModTime(), e.opt.ModifyWindow) {
+				// Unchanged, unless an earlier --rescue installed it with zeros.
+				if f.patch = e.loadMarker(f); f.patch == nil {
+					e.filesSkipped.Add(1)
+					e.bytesSkipped.Add(size)
+					return true
+				}
+			}
 			e.filesTotal.Add(1)
 			e.bytesTotal.Add(size)
 			e.q.push(f)
@@ -444,24 +482,36 @@ func kindOf(m fs.FileMode) string {
 	return "special file"
 }
 
-// claimTmp picks the hidden file a copy is written to before it's renamed
-// into place: .tclone-<hash of the name>.part beside the destination. The name
-// is the same from run to run, so a rerun replaces its own leftover from an
-// interrupted run. Within one run each claim is unique: if another file in
-// flight already holds that name (two names that differ only by case, on a
-// disk that ignores case), a numbered one is used.
-func (e *Engine) claimTmp(dst string) string {
+// tmpBase is .tclone-<hash of the name> beside the destination; the part,
+// its map and a rescue marker are this plus .part, .map and .bad.
+func (e *Engine) tmpBase(dst string) string {
 	h := fnv.New64a()
 	io.WriteString(h, filepath.Base(dst))
-	base := filepath.Join(filepath.Dir(dst), fmt.Sprintf(".tclone-%012x", h.Sum64()&0xffffffffffff))
+	return filepath.Join(filepath.Dir(dst), fmt.Sprintf(".tclone-%012x", h.Sum64()&0xffffffffffff))
+}
+
+// claimTmp picks the hidden file a copy is written to before it's renamed
+// into place. The plain name (base + ".part") is the same from run to run, so
+// a rerun can resume from it or replace it. Within one run each claim is
+// unique: if another file in flight already holds that name (two names that
+// differ only by case, on a disk that ignores case), a numbered one is used,
+// and base comes back empty: that copy can't be resumed.
+func (e *Engine) claimTmp(dst string) (name, base string) {
+	b := e.tmpBase(dst)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	name := base + ".part"
-	for n := 2; e.tmps[strings.ToLower(name)]; n++ {
-		name = fmt.Sprintf("%s-%d.part", base, n)
+	name = partPath(b)
+	if !e.tmps[strings.ToLower(name)] {
+		e.tmps[strings.ToLower(name)] = true
+		return name, b
 	}
-	e.tmps[strings.ToLower(name)] = true
-	return name
+	for n := 2; ; n++ {
+		name = fmt.Sprintf("%s-%d.part", b, n)
+		if !e.tmps[strings.ToLower(name)] {
+			e.tmps[strings.ToLower(name)] = true
+			return name, ""
+		}
+	}
 }
 
 func (e *Engine) releaseTmp(name string) {
@@ -480,7 +530,7 @@ func (e *Engine) copyLink(en plan.Entry) {
 		e.filesSkipped.Add(1)
 		return
 	}
-	tmp := e.claimTmp(en.Dst)
+	tmp, _ := e.claimTmp(en.Dst)
 	defer e.releaseTmp(tmp)
 	os.Remove(tmp) // a leftover of tclone's own, from an earlier run
 	if err := os.Symlink(target, tmp); err != nil {
@@ -513,25 +563,46 @@ func (e *Engine) dispatch(ctx context.Context) {
 		e.mu.Lock()
 		e.active[f] = struct{}{}
 		e.mu.Unlock()
-		var off int64
-		for first := true; first || off < f.size; first = false {
-			n := int(e.chunk.Load())
-			if rem := f.size - off; int64(n) > rem {
-				n = int(rem)
-			}
+		e.prepare(f)
+		todo := ranges{{0, f.size}}
+		if f.resuming {
+			f.rangeMu.Lock()
+			todo = f.doneSet.gaps(f.size)
+			f.rangeMu.Unlock()
+		}
+		sent := false
+		send := func(j job) bool {
 			f.refs.Add(1)
 			select {
-			case e.jobs <- job{f: f, off: off, n: n}:
+			case e.jobs <- j:
+				sent = true
+				return true
 			case <-ctx.Done():
 				f.refs.Add(-1)
 				f.canceled.Store(true)
-				e.release(f)
-				return
+				return false
 			}
-			off += int64(n)
-			if f.failed.Load() {
-				break
+		}
+	cut:
+		for _, g := range todo {
+			for off := g.Off; off < g.end(); {
+				n := int64(e.chunk.Load())
+				if rem := g.end() - off; n > rem {
+					n = rem
+				}
+				if !send(job{f: f, off: off, n: int(n)}) {
+					e.release(f)
+					return
+				}
+				off += n
+				if f.failed.Load() {
+					break cut
+				}
 			}
+		}
+		if !sent && !send(job{f: f}) { // nothing to read (empty, or done before): still open and finish
+			e.release(f)
+			return
 		}
 		e.release(f)
 	}
@@ -556,11 +627,14 @@ func (e *Engine) worker(ctx context.Context, id int) {
 		// Monotonic, from the run's start (+1 so 0 means idle): the wall
 		// clock can jump, and stands still neither while the Mac sleeps.
 		e.opStart[id].Store(int64(t0.Sub(e.start)) + 1)
-		n := e.copyChunk(ctx, j, &buf)
+		n, clean := e.copyChunk(ctx, j, &buf)
 		t1 := time.Now()
 		// Record before the op stops counting as in flight, so no window
-		// can be closed without it.
-		e.tuner.Record(tuner.Op{Start: t0.Sub(e.start), End: t1.Sub(e.start), Bytes: int64(n)})
+		// can be closed without it. A chunk that hit unreadable sectors says
+		// nothing about the setting, so the tuner doesn't see it.
+		if clean {
+			e.tuner.Record(tuner.Op{Start: t0.Sub(e.start), End: t1.Sub(e.start), Bytes: int64(n)})
+		}
 		e.opStart[id].Store(0)
 		e.gate.release()
 		e.release(j.f)
@@ -574,17 +648,19 @@ func (e *Engine) open(f *file) error {
 			f.openErr = err
 			return
 		}
-		f.tmp = e.claimTmp(f.dst)
-		df, err := os.OpenFile(f.tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if errors.Is(err, fs.ErrExist) {
-			// Not in use this run (claimTmp says so): tclone's own leftover from an earlier one.
-			os.Remove(f.tmp)
+		var df *os.File
+		if f.resuming {
+			df, err = os.OpenFile(f.tmp, os.O_WRONLY, 0)
+		} else {
 			df, err = os.OpenFile(f.tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if errors.Is(err, fs.ErrExist) {
+				// Not in use this run (the claim says so): tclone's own leftover.
+				os.Remove(f.tmp)
+				df, err = os.OpenFile(f.tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			}
 		}
 		if err != nil {
 			sf.Close()
-			e.releaseTmp(f.tmp)
-			f.tmp = ""
 			f.openErr = err
 			return
 		}
@@ -592,26 +668,30 @@ func (e *Engine) open(f *file) error {
 			noCache(sf)
 			noCache(df)
 		}
+		f.ioMu.Lock()
 		f.sf, f.df = sf, df
+		f.ioMu.Unlock()
 	})
 	return f.openErr
 }
 
-func (e *Engine) copyChunk(ctx context.Context, j job, buf *[]byte) int {
+// copyChunk copies one chunk. clean is false when it ran into unreadable
+// sectors (and was salvaged piece by piece).
+func (e *Engine) copyChunk(ctx context.Context, j job, buf *[]byte) (n int, clean bool) {
 	f := j.f
-	if f.failed.Load() {
-		return 0
+	if f.failed.Load() || f.canceled.Load() {
+		return 0, true
 	}
 	if err := e.open(f); err != nil {
 		f.fail("open", err)
-		return 0
+		return 0, true
 	}
 	if j.n == 0 {
-		return 0
+		return 0, true
 	}
 	b := alignedBuf(buf, j.n)
-	var n int
 	var err error
+	shrank := false
 	for attempt := 1; ; attempt++ {
 		n, err = e.readAt(f, b, j.off)
 		if n == j.n {
@@ -619,15 +699,15 @@ func (e *Engine) copyChunk(ctx context.Context, j job, buf *[]byte) int {
 			break
 		}
 		if err == nil || errors.Is(err, io.EOF) {
+			shrank = true
 			err = fmt.Errorf("file shrank to %d bytes while being copied (was %d)", j.off+int64(n), f.size)
 			break
 		}
 		if ctx.Err() != nil {
 			f.canceled.Store(true)
-			return 0
+			return 0, true
 		}
 		if attempt >= e.opt.Retries {
-			err = fmt.Errorf("%w (%d tries)", err, attempt)
 			break
 		}
 		e.retries.Add(1)
@@ -635,29 +715,43 @@ func (e *Engine) copyChunk(ctx context.Context, j job, buf *[]byte) int {
 		case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
 		case <-ctx.Done():
 			f.canceled.Store(true)
-			return 0
+			return 0, true
 		}
 	}
 	e.readBytes.Add(int64(n))
-	if err != nil {
+	if shrank {
 		f.fail(fmt.Sprintf("read at byte %d", j.off), err)
-		return 0
+		return 0, true
+	}
+	if err != nil {
+		good := e.salvage(f, func() bool { return ctx.Err() != nil }, b, j.off)
+		e.counted(f, good)
+		return good, false
 	}
 	if _, err := f.df.WriteAt(b, j.off); err != nil {
 		f.fail("write", err)
-		return 0
+		return 0, true
+	}
+	e.addDone(f, j.off, int64(n))
+	e.counted(f, n)
+	return n, true
+}
+
+// counted adds n freshly copied bytes to the meters and totals.
+func (e *Engine) counted(f *file, n int) {
+	if n <= 0 {
+		return
 	}
 	now := time.Now()
 	f.meter.Add(int64(n), now)
 	e.global.Add(int64(n), now)
 	f.done.Add(int64(n))
 	e.bytesDone.Add(int64(n))
-	return n
 }
 
 func (e *Engine) readAt(f *file, b []byte, off int64) (int, error) {
 	if e.readFault != nil {
-		if err := e.readFault(f.show, off); err != nil {
+		if err := e.readFault(f.show, off, len(b)); err != nil {
 			return 0, err
 		}
 	}
@@ -698,18 +792,30 @@ func (e *Engine) finish(f *file) {
 		delete(e.active, f)
 		e.mu.Unlock()
 	}()
+	f.ioMu.Lock()
+	defer f.ioMu.Unlock()
+	f.closed = true
 	if f.sf != nil {
 		f.sf.Close()
 	}
+	f.rangeMu.Lock()
+	bad := f.badSet.clone()
+	f.rangeMu.Unlock()
 	failed, canceled := f.failed.Load(), f.canceled.Load()
-	if !failed && !canceled && f.df != nil {
-		if err := e.install(f); err != nil {
+	// A file re-reading the holes of an earlier rescue is installed whatever
+	// it found: it can only have fewer holes than the one it replaces.
+	rescue := len(bad) > 0 && (e.opt.Rescue || f.patch != nil)
+	kept := false
+	switch {
+	case failed || f.df == nil:
+		e.discard(f)
+	case canceled || (len(bad) > 0 && !rescue):
+		kept = e.keepPart(f)
+	default:
+		if err := e.install(f, bad); err != nil {
 			f.fail("finish", err)
 			failed = true
 		}
-	} else if f.df != nil {
-		f.df.Close()
-		os.Remove(f.tmp) // tclone's own partial file
 	}
 	if f.tmp != "" {
 		e.releaseTmp(f.tmp)
@@ -724,14 +830,72 @@ func (e *Engine) finish(f *file) {
 		e.bytesFailed.Add(f.size)
 	case canceled:
 		e.bytesDone.Add(-f.done.Load())
+	case len(bad) > 0 && !rescue:
+		next := "rerun to retry them"
+		if kept {
+			next = "the bytes that read fine are kept for the next run, which retries only these ranges"
+		}
+		e.logErr("read", f.src, fmt.Errorf("unreadable: %s (%s, %d bytes); not copied: %s, or add --rescue to finish the file with zeros there", bad.describe(32), count(len(bad), "range"), bad.total(), next))
+		e.filesFailed.Add(1)
+		e.bytesDone.Add(-f.done.Load())
+		e.bytesFailed.Add(f.size)
+	case len(bad) > 0:
+		e.logErr("read", f.src, fmt.Errorf("unreadable: %s (%s, %d bytes); installed with zeros there (--rescue); a later run tries these ranges again", bad.describe(32), count(len(bad), "range"), bad.total()))
+		e.filesDone.Add(1)
+		e.filesRescued.Add(1)
+		e.bytesDone.Add(bad.total()) // the file is finished, holes and all
+		e.bytesZeroed.Add(bad.total())
 	default:
 		e.filesDone.Add(1)
 	}
 }
 
-// install gives the finished temporary file its mode and times and renames it into place.
-func (e *Engine) install(f *file) error {
-	err := f.df.Chmod(f.mode.Perm() | f.mode&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky))
+// discard removes a part that can't be used, and its map.
+func (e *Engine) discard(f *file) {
+	if f.df != nil {
+		f.df.Close()
+	}
+	if f.tmp != "" {
+		os.Remove(f.tmp) // tclone's own partial file
+	}
+	if f.base != "" {
+		os.Remove(mapPath(f.base))
+	}
+}
+
+// keepPart saves a stopped file's progress for the next run, when there is
+// any worth keeping and the part can be found again; otherwise it discards it.
+func (e *Engine) keepPart(f *file) bool {
+	f.rangeMu.Lock()
+	have := f.doneSet.total()
+	f.rangeMu.Unlock()
+	if f.base == "" || have == 0 || f.df == nil {
+		e.discard(f)
+		return false
+	}
+	if err := e.saveProgress(f); err != nil {
+		e.discard(f)
+		return false
+	}
+	f.df.Close()
+	return true
+}
+
+// install gives the finished temporary file its mode and times and renames
+// it into place. With unreadable ranges (--rescue), it zero-fills them and
+// leaves a .bad marker naming them, written before the rename so the file is
+// never in place without it.
+func (e *Engine) install(f *file, bad ranges) error {
+	marker := markerPath(e.tmpBase(f.dst))
+	err := zeroFill(f.df, bad)
+	if err == nil {
+		if fi, serr := f.df.Stat(); serr == nil && fi.Size() != f.size {
+			err = f.df.Truncate(f.size)
+		}
+	}
+	if err == nil {
+		err = f.df.Chmod(f.mode.Perm() | f.mode&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky))
+	}
 	if err == nil {
 		// Data reaches the disk before the name does, so a crash can't leave a
 		// complete-looking file (right size and time, so skipped next run)
@@ -744,13 +908,26 @@ func (e *Engine) install(f *file) error {
 	if err == nil {
 		err = os.Chtimes(f.tmp, f.mtime, f.mtime)
 	}
+	if err == nil && len(bad) > 0 {
+		err = saveMap(marker, &mapFile{V: 1, Name: filepath.Base(f.dst), Size: f.size, MTime: f.mtime.UnixNano(), Done: bad.gaps(f.size).pairs(), Bad: bad.pairs()})
+	}
 	if err == nil {
 		err = os.Rename(f.tmp, f.dst)
 	}
 	if err != nil {
 		os.Remove(f.tmp)
+		if f.base != "" {
+			os.Remove(mapPath(f.base))
+		}
+		return err
 	}
-	return err
+	if len(bad) == 0 {
+		os.Remove(marker) // whole now
+	}
+	if f.base != "" {
+		os.Remove(mapPath(f.base))
+	}
+	return nil
 }
 
 // fixDirs gives directories their source modes and times, deepest first, once
@@ -869,6 +1046,7 @@ func (e *Engine) pollDevices(now time.Time, force bool) {
 		}
 		w.view.OK = true
 		w.view.Idle = true
+		w.view.Window = now.Sub(w.hist[0].at) // idle this long, unless movement is found below
 		for k := len(w.hist) - 2; k >= 0; k-- {
 			a := w.hist[k]
 			if now.Sub(a.at) >= time.Second && w.moved(a.s, s) {
@@ -901,6 +1079,13 @@ func (e *Engine) Snapshot() Snapshot {
 		Tuner:        e.tuner.Status(now.Sub(e.start)),
 		Canceled:     e.canceled.Load(),
 		Done:         e.done.Load(),
+		BytesResumed: e.bytesResumed.Load(),
+		BytesZeroed:  e.bytesZeroed.Load(),
+		BadRanges:    e.badRanges.Load(),
+		BadBytes:     e.badBytes.Load(),
+		BadFiles:     e.badFiles.Load(),
+		FilesRescued: e.filesRescued.Load(),
+		Rescue:       e.opt.Rescue,
 		Peak:         float64frombits(e.peak.Load()),
 	}
 	s.Rate, s.RateOK = e.global.Rate(now)

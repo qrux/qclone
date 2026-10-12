@@ -19,7 +19,7 @@ LOG    := $(shell sed -n 's/^log=//p' $(ROOT)/.treeflow/project-type)
 LOGGED  = $(LOG) -n $@ --
 DEMO   := build/demo
 .DEFAULT_GOAL := help
-.PHONY: help build test demo demo-fixed install
+.PHONY: help build test demo demo-fixed demo-rescue install
 
 help:
 	@grep -E '^## ' $(firstword $(MAKEFILE_LIST)) | sed 's/^## /  /'
@@ -42,6 +42,13 @@ demo:
 ## demo-fixed: the same copy at rclone's default of 4 readers, never tuned, to compare
 demo-fixed:
 	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/tclone ./cmd/tclone && go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/tclone --simulate degraded --fixed --readers 4 --chunk 1M --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
+
+## demo-rescue: the copy from a simulated failing SSD that has some unreadable sectors: once
+##   plain (unreadable spots mapped to 4 KiB, those files kept unfinished), then again with
+##   --rescue (only the spots are read again; the files are installed with zeros there). Both
+##   runs end with status 1, as any run with unreadable spots does; that is expected here.
+demo-rescue:
+	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/tclone ./cmd/tclone && go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst-rescue && { build/tclone --simulate failing --errors $(DEMO)/errors-1.txt $(DEMO)/src/ $(DEMO)/dst-rescue || test $$? -eq 1; } && { build/tclone --simulate failing --rescue --errors $(DEMO)/errors-2.txt $(DEMO)/src/ $(DEMO)/dst-rescue || test $$? -eq 1; }'
 
 ## install: build, then copy tclone to ~/bin/tclone
 install:

@@ -36,6 +36,39 @@ tclone [flags] SRC [SRC...] DST
   the first error happens. Exit status: 0 done, 1 some errors, 2 bad arguments,
   130 stopped.
 
+## Interrupted copies resume; unreadable spots are mapped
+
+This works like ddrescue's mapfile. While a file copies, tclone keeps a
+`.tclone-<hash>.map` beside its `.part` file, recording which byte ranges are
+written. The map is updated every 2 seconds, only after an `fsync`, so it never
+claims more than the disk has. It is updated once more when the run stops.
+Rerun the same command after Ctrl-C, a crash or a `kill`, and each file carries
+on from where it stopped, if its source still has the same size and
+modification time. A map for an older version of the source is thrown away.
+
+A chunk that still can't be read after 3 tries is split in halves, and the
+halves that fail are split again, down to 4 KiB sectors. Everything readable is
+kept, and the unreadable ranges are recorded exactly. A single bad sector in a
+1 MiB chunk costs about a dozen reads. A dying drive can take seconds per
+failed read, so bisection of one chunk stops after 64 failed reads, and
+whatever is still unresolved is recorded as one coarser range.
+
+- **Without `--rescue`**, a file with unreadable spots is not installed. Its part
+  and map stay, and the error file lists each spot ("4096 bytes at 2105344").
+  A rerun reads only those spots, since drives sometimes succeed on a later try.
+- **With `--rescue`**, the spots are filled with zeros and the file is installed.
+  A `.tclone-<hash>.bad` marker next to it lists the spots. The marker matters:
+  the file has the source's size and time, so without it every later run would
+  skip it as unchanged, holes and all. With it, a later run clones the
+  installed file (instant on APFS, a plain copy elsewhere), reads only the
+  spots, and installs the result. When no spots are left, the marker goes away.
+
+The display and the end-of-run summary show the bytes carried over from
+earlier runs and the unreadable bytes, spots and files (counts only, never
+names). The usual way to get everything off a failing drive is two passes: one
+plain pass to get all the good data, then `--rescue` once nothing more comes
+back.
+
 ## The rate never reads zero
 
 A meter that counts bytes in the last second shows 0 B/s whenever one read
@@ -123,11 +156,14 @@ and paths are never written to stdout, so a log of a run holds none.
     --chunk SIZE     bytes per read, e.g. 256K, 4M; fixes it (default: tuned, from 256K)
     --fixed          don't tune: keep --readers and --chunk as given
     --errors FILE    where errors go (default: <timestamp>-tclone-errors.txt here)
+    --rescue         install files with unreadable spots, zeros there (listed in the
+                     error file; a later run tries those spots again)
     --cached         read and write through the OS file cache
     --plain          no full-screen display: a status line every 10 seconds
     --no-color       no colors (NO_COLOR is honored too)
-    --simulate degraded
-                     pretend the source is a degraded SSD (for a demo or a test)
+    --simulate degraded|failing
+                     pretend the source is a degraded SSD (for a demo or a test);
+                     "failing" adds some sectors that can't be read
 ```
 
 Flags may go anywhere on the line, as with rclone. Ctrl-C stops cleanly: reads
@@ -141,13 +177,16 @@ make build       # build/tclone
 make test        # vet and all tests, with the race detector
 make demo        # ~1 GB copy on a simulated degraded SSD, to watch the tuner work
 make demo-fixed  # the same copy at a fixed 4 readers x 1M, for comparison
+make demo-rescue # a failing drive: a plain pass, then a --rescue pass
 make install     # copy tclone to ~/bin
 ```
 
 The simulated drive (`--simulate degraded`) treats any path component starting
 with "old" as slow (0.6 MB/s per read, 8 MB/s for the whole drive), along with
 about 30% of the 32 MiB regions inside big files. Everything else is fast (500
-MB/s). Data really is copied; only the timing is simulated.
+MB/s). Data really is copied; only the timing is simulated. `--simulate failing`
+also makes about one 4 KiB sector in 6000 of the slow regions unreadable (each
+failed read takes 200 ms, as on a real drive).
 
 ## Limits
 
@@ -156,5 +195,6 @@ MB/s). Data really is copied; only the timing is simulated.
 - Not copied: extended attributes, ACLs, resource forks, Finder tags, file
   flags, ownership, hard links (each link becomes its own file), and symlink
   times.
-- A file whose read fails after 3 tries fails as a whole: no partial rescue,
-  no zero-fill. An interrupted big file starts over on the next run.
+- A destination file with unreadable spots stays unfinished until you add
+  `--rescue`. The hidden `.part`, `.map` and `.bad` files stay in the
+  destination until the file is whole.

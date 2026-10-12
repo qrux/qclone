@@ -133,6 +133,9 @@ func (r *renderer) header() []*line {
 	s := r.s
 	l := r.nl()
 	l.add(inverse, " tclone ")
+	if s.Rescue {
+		l.add(bred, " rescue")
+	}
 	l.add(plain, "  ")
 	src := ""
 	if len(r.f.Sources) == 1 {
@@ -215,10 +218,31 @@ func (r *renderer) total() []*line {
 	if s.Links > 0 {
 		st.add(gray, "   ").add(plain, Count(s.Links)+" links")
 	}
+
 	if s.Scanning {
 		st.add(gray, "   ").add(yellow, "scanning...")
 	}
-	return []*line{l, st}
+	out := []*line{l, st}
+	// Rescue news gets its own line so it is never clipped off the end.
+	if s.BytesResumed > 0 || s.BadRanges > 0 {
+		rl := r.nl().pad(labelW)
+		if s.BytesResumed > 0 {
+			rl.add(plain, Bytes(s.BytesResumed)+" resumed from an earlier run")
+		}
+		if s.BadRanges > 0 {
+			if s.BytesResumed > 0 {
+				rl.add(gray, "   ")
+			}
+			rl.add(bred, fmt.Sprintf("%s unreadable (%s in %s)", Bytes(s.BadBytes), plural(int(s.BadRanges), "spot"), plural(int(s.BadFiles), "file")))
+			if s.Rescue {
+				rl.add(red, ", zero-filled")
+			} else {
+				rl.add(red, ", those files kept for a rerun")
+			}
+		}
+		out = append(out, rl)
+	}
+	return out
 }
 
 // spc picks seconds per chart column so the chart covers the whole run, up to
@@ -243,6 +267,8 @@ func (r *renderer) speedHeader() *line {
 	l := r.nl()
 	l.add(bcyan, " SPEED  ")
 	switch {
+	case !s.RateOK && s.Done && s.BadRanges > 0:
+		l.add(byellow, "nothing new could be read")
 	case !s.RateOK && s.Done:
 		l.add(plain, "nothing to copy")
 	case s.Done:
@@ -328,7 +354,11 @@ func (r *renderer) chart(rows, readerRows int) []*line {
 		for i := 0; i < rows; i++ {
 			l := r.nl().add(gray, fmt.Sprintf("%6s |", ""))
 			if i == rows/2 {
-				l.add(gray, "  waiting for the first chunk to land")
+				if r.s.Done {
+					l.add(gray, "  no data was read")
+				} else {
+					l.add(gray, "  waiting for the first chunk to land")
+				}
 			}
 			out = append(out, l)
 		}
@@ -485,7 +515,11 @@ func (r *renderer) tuner() []*line {
 	l.add(bcyan, " TUNER  ")
 	l.add(bold, settingText(st.Applied))
 	l2 := r.nl().pad(labelW)
-	switch st.Mode {
+	mode := st.Mode
+	if r.s.Done && mode != "fixed" {
+		mode = "done"
+	}
+	switch mode {
 	case "fixed":
 		l.add(gray, "   fixed (--fixed)")
 	case "warming up":
@@ -597,7 +631,10 @@ func (r *renderer) diskStats(m *line, d copier.DeviceView) {
 		return
 	}
 	if d.Idle {
-		m.add(gray, "idle (nothing for 2 minutes)")
+		m.add(gray, "idle for "+Ago(d.Window))
+		if d.Errors > 0 || d.Retries > 0 {
+			m.add(bred, fmt.Sprintf("  errors %d  retries %d", d.Errors, d.Retries))
+		}
 		return
 	}
 	rt := d.Rates

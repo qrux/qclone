@@ -210,3 +210,31 @@ func TestLadder(t *testing.T) {
 		}
 	}
 }
+
+func TestRescueCountsShown(t *testing.T) {
+	s := fakeSnapshot(time.Now())
+	s.BytesResumed, s.BadRanges, s.BadBytes, s.BadFiles, s.FilesRescued, s.Rescue = 1_200_000_000, 3, 20480, 2, 1, true
+	h := NewHistory(s.Start)
+	f := Frame{W: 120, H: 50, Sources: []string{"/Volumes/Old/photos"}, Dst: "/Users/q/rescue"}
+	frame := stripANSI(strings.Join(Render(f, s, h), "\n"))
+	for _, want := range []string{"1.20 GB resumed from an earlier run", "20.5 kB unreadable (3 spots in 2 files), zero-filled", " rescue"} {
+		if !strings.Contains(frame, want) {
+			t.Errorf("frame lacks %q", want)
+		}
+	}
+	sum := strings.Join(Summary(s), "\n")
+	for _, want := range []string{"1.20 GB carried over from an earlier run", "20.5 kB unreadable in 3 spots, in 2 files", "1 file installed with zeros", "1 file not installed"} {
+		if !strings.Contains(sum, want) {
+			t.Errorf("summary lacks %q:\n%s", want, sum)
+		}
+	}
+	line := StatusLine(s)
+	if !strings.Contains(line, "3 spots") || strings.Contains(line, "/") && strings.Contains(line, "Volumes") {
+		t.Errorf("status line %q", line)
+	}
+	for _, l := range append(Summary(s), line) {
+		if strings.Contains(l, "/Volumes") || strings.Contains(l, "/Users") {
+			t.Errorf("a path reached stdout text: %q", l)
+		}
+	}
+}

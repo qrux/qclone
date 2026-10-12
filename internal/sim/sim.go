@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"tclone/internal/devstat"
@@ -33,6 +34,9 @@ type Profile struct {
 	RegionSize int64   // big files are split into regions this size
 	SlowShare  float64 // share of a big file's regions that are slow
 	OldMarker  string  // any path component starting with this marks the whole file slow
+
+	BadEvery  int           // in slow regions, about one 4 KiB sector in this many can't be read (0: none)
+	FailDelay time.Duration // how long a read that hits one takes to fail
 }
 
 // Degraded is the case tclone was built for: about 2 MB/s in old regions at rclone's
@@ -47,6 +51,31 @@ func Degraded() Profile {
 		SlowShare:  0.3,
 		OldMarker:  "old",
 	}
+}
+
+// Failing is Degraded with some sectors in its slow regions that can't be
+// read at all, as on a drive past saving: for the rescue demo.
+func Failing() Profile {
+	p := Degraded()
+	p.BadEvery = 6000
+	p.FailDelay = 200 * time.Millisecond
+	return p
+}
+
+// badSector says whether the 4 KiB sector at index i of the file named key is unreadable.
+func (p Profile) badSector(key string, size, i int64) bool {
+	if p.BadEvery <= 0 || p.RegionFor(key, size, i*4096) != p.Slow {
+		return false
+	}
+	h := fnv.New32a()
+	io.WriteString(h, key)
+	var b [8]byte
+	for k := range b {
+		b[k] = byte(i >> (8 * k))
+	}
+	h.Write(b[:])
+	h.Write([]byte("bad"))
+	return h.Sum32()%uint32(p.BadEvery) == 0
 }
 
 // Model is the drive's queue in virtual time.
@@ -115,6 +144,15 @@ func NewDevice(p Profile) *Device { return &Device{p: p, start: time.Now()} }
 // ReadAt reads from f as the simulated drive would: the bytes are real, the
 // time taken is the model's.
 func (d *Device) ReadAt(key string, size int64, f io.ReaderAt, buf []byte, off int64) (int, error) {
+	for i := off / 4096; i*4096 < off+int64(len(buf)); i++ {
+		if d.p.badSector(key, size, i) {
+			time.Sleep(d.p.FailDelay)
+			d.mu.Lock()
+			d.stats.ReadErrors++
+			d.mu.Unlock()
+			return 0, syscall.EIO
+		}
+	}
 	r := d.p.RegionFor(key, size, off)
 	issued := time.Now()
 	end := d.m.Schedule(issued.Sub(d.start), r, len(buf))

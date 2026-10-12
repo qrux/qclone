@@ -37,12 +37,21 @@ flags:
       --chunk SIZE     bytes per read, e.g. 256K, 4M; fixes it (default: tuned, from 256K)
       --fixed          don't tune: keep --readers and --chunk as given
       --errors FILE    where errors go (default: <timestamp>-tclone-errors.txt here)
+      --rescue         install files that have unreadable spots, with zeros there
+                       (each spot is listed in the error file; a later run
+                       tries those spots again)
       --cached         read and write through the OS file cache
       --plain          no full-screen display: a status line every 10 seconds
       --no-color       no colors
-      --simulate degraded
-                       pretend the source is a degraded SSD (for a demo or a test)
+      --simulate degraded|failing
+                       pretend the source is a degraded SSD (for a demo or a
+                       test); "failing" adds some sectors that can't be read
   -h, --help           this help
+
+An interrupted copy resumes: rerun the same command and each file carries on
+from where it stopped. A spot the source can't read is narrowed down to 4 KiB;
+without --rescue that file isn't installed, and a rerun retries just its
+unreadable spots.
 
 Errors never go to the terminal; they go to the error file, which is only
 created if there is an error. Exit status: 0 done, 1 some errors, 2 bad
@@ -80,6 +89,7 @@ func run(args []string) (code int) {
 	fixed := fs.Bool("fixed", false, "")
 	errPath := fs.String("errors", "", "")
 	cached := fs.Bool("cached", false, "")
+	rescue := fs.Bool("rescue", false, "")
 	plainOnly := fs.Bool("plain", false, "")
 	noColor := fs.Bool("no-color", false, "")
 	simulate := fs.String("simulate", "", "")
@@ -145,8 +155,10 @@ func run(args []string) (code int) {
 	case "":
 	case "degraded":
 		dev = sim.NewDevice(sim.Degraded())
+	case "failing":
+		dev = sim.NewDevice(sim.Failing())
 	default:
-		return bad("--simulate knows only \"degraded\"")
+		return bad("--simulate knows \"degraded\" and \"failing\"")
 	}
 	p, err := plan.Resolve(pos)
 	if err != nil {
@@ -189,6 +201,7 @@ func run(args []string) (code int) {
 		Retries:      3,
 		Errors:       errLog,
 		Sim:          dev,
+		Rescue:       *rescue,
 	})
 	hist := ui.NewHistory(eng.Snapshot().Start)
 	var tui *ui.TUI

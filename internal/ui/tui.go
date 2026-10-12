@@ -148,6 +148,12 @@ func StatusLine(s copier.Snapshot) string {
 		settingText(s.Tuner.Applied),
 		Count(s.Errors) + " errors",
 	}
+	if s.BytesResumed > 0 {
+		parts = append(parts, Bytes(s.BytesResumed)+" resumed")
+	}
+	if s.BadRanges > 0 {
+		parts = append(parts, Bytes(s.BadBytes)+" unreadable in "+plural(int(s.BadRanges), "spot"))
+	}
 	if s.Scanning {
 		parts = append(parts, "scanning")
 	} else if s.Avg > 0 && !s.Done {
@@ -169,7 +175,13 @@ func Summary(s copier.Snapshot) []string {
 	if s.FilesDone == 1 {
 		files = "1 file"
 	}
-	l1 := fmt.Sprintf("%s. Copied %s in %s", head, Bytes(s.BytesDone), files)
+	// Bytes carried over from an earlier run, and zeros standing in for
+	// unreadable ones, weren't copied by this run.
+	copied := s.BytesDone - s.BytesResumed - s.BytesZeroed
+	l1 := fmt.Sprintf("%s. Copied %s in %s", head, Bytes(copied), files)
+	if copied == 0 && s.FilesDone > 0 {
+		l1 = fmt.Sprintf("%s. Finished %s; no new bytes could be read", head, files)
+	}
 	if s.Avg > 0 {
 		l1 += fmt.Sprintf(" (avg %s, peak %s)", Rate(s.Avg), Rate(s.Peak))
 	}
@@ -196,6 +208,19 @@ func Summary(s copier.Snapshot) []string {
 		l2 += "; learned " + strings.Join(parts, ", ")
 	}
 	out = append(out, l2+".")
+	if s.BytesResumed > 0 {
+		out = append(out, fmt.Sprintf("tclone: %s carried over from an earlier run (partial or zero-filled copies), not read again.", Bytes(s.BytesResumed)))
+	}
+	if s.BadRanges > 0 {
+		l := fmt.Sprintf("tclone: %s unreadable in %s, in %s", Bytes(s.BadBytes), plural(int(s.BadRanges), "spot"), plural(int(s.BadFiles), "file"))
+		if s.FilesRescued > 0 {
+			l += fmt.Sprintf("; %s installed with zeros there (a later run tries those spots again)", plural(int(s.FilesRescued), "file"))
+		}
+		if n := s.BadFiles - s.FilesRescued; n > 0 {
+			l += fmt.Sprintf("; %s not installed: rerun to retry just those spots, or add --rescue", plural(int(n), "file"))
+		}
+		out = append(out, l+".")
+	}
 	switch {
 	case s.Errors > 0:
 		out = append(out, fmt.Sprintf("tclone: %s errors, written to %s", Count(s.Errors), filepath.Base(s.ErrorFile)))
