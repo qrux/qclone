@@ -325,3 +325,118 @@ loop:
 	}
 	sameTree(t, src, dst)
 }
+
+// Two sources whose files differ only by letter case land on one file on a
+// disk that ignores case: the second is skipped and logged, and the first is
+// installed whole (they used to share a temp file and mix).
+func TestCaseCollisionSkipsSecond(t *testing.T) {
+	base := t.TempDir()
+	if caseSensitive(base) {
+		t.Skip("temp folder is on a case-sensitive volume")
+	}
+	makeTree(t, filepath.Join(base, "a"), []spec{{"Docs/x.bin", 3 << 20, 0}})
+	makeTree(t, filepath.Join(base, "b"), []spec{{"docs/x.bin", 1 << 20, 0}})
+	dst := filepath.Join(base, "dst")
+	_, s := run(t, []string{filepath.Join(base, "a") + "/", filepath.Join(base, "b") + "/", dst}, opts(filepath.Join(base, "e.txt")))
+	if s.FilesDone != 1 || s.Errors != 1 {
+		t.Fatalf("done %d errors %d (%s); want 1 and 1", s.FilesDone, s.Errors, s.LastError)
+	}
+	if sum(t, filepath.Join(dst, "Docs", "x.bin")) != sum(t, filepath.Join(base, "a", "Docs", "x.bin")) {
+		t.Fatal("destination does not hold the first source's file")
+	}
+	noPartials(t, dst)
+}
+
+// A read-only source directory must not stop a rerun from retrying a file
+// that failed in it.
+func TestRerunRetriesUnderReadOnlyDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes everywhere")
+	}
+	base := t.TempDir()
+	src := filepath.Join(base, "s")
+	makeTree(t, src, []spec{{"ro/flaky.bin", 1 << 20, 0}, {"ro/fine.txt", 10, 0}})
+	os.Chmod(filepath.Join(src, "ro"), 0o555)
+	defer os.Chmod(filepath.Join(src, "ro"), 0o755)
+	dst := filepath.Join(base, "d")
+	defer filepath.WalkDir(dst, func(p string, d fs.DirEntry, err error) error {
+		if d != nil && d.IsDir() {
+			os.Chmod(p, 0o755) // so t.TempDir can clean up
+		}
+		return nil
+	})
+	o := opts(filepath.Join(base, "e1.txt"))
+	p, _ := plan.Resolve([]string{src + "/", dst})
+	e := New(p, o)
+	e.readFault = func(show string, off int64) error {
+		if strings.HasSuffix(show, "flaky.bin") {
+			return syscall.EIO
+		}
+		return nil
+	}
+	e.Run(context.Background())
+	o.Errors.Close()
+	if fi, _ := os.Stat(filepath.Join(dst, "ro")); fi.Mode().Perm() != 0o555 {
+		t.Fatalf("dir mode %v after the run, want the source's 0555", fi.Mode().Perm())
+	}
+	_, s := run(t, []string{src + "/", dst}, opts(filepath.Join(base, "e2.txt")))
+	if s.FilesDone != 1 || s.FilesSkipped != 1 || s.Errors != 0 {
+		t.Fatalf("rerun: done %d skipped %d errors %d (%s)", s.FilesDone, s.FilesSkipped, s.Errors, s.LastError)
+	}
+	sameTree(t, src, dst)
+}
+
+// Ctrl-C while a bad chunk is waiting to be retried is a cancel, not an error.
+func TestCancelDuringRetryIsNotAnError(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "s")
+	makeTree(t, src, []spec{{"bad.bin", 1 << 20, 0}})
+	dst := filepath.Join(base, "d")
+	o := opts(filepath.Join(base, "e.txt"))
+	o.Retries = 50
+	p, _ := plan.Resolve([]string{src + "/", dst})
+	e := New(p, o)
+	e.readFault = func(string, int64) error { return syscall.EIO }
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(600 * time.Millisecond); cancel() }()
+	e.Run(ctx)
+	s := e.Snapshot()
+	if !s.Canceled || s.FilesFailed != 0 || s.Errors != 0 {
+		t.Fatalf("canceled %v failed %d errors %d (%s)", s.Canceled, s.FilesFailed, s.Errors, s.LastError)
+	}
+	noPartials(t, dst)
+}
+
+// A symlink where the destination needs a directory is not followed.
+func TestDestinationSymlinkNotFollowed(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "s")
+	makeTree(t, src, []spec{{"sub/f.txt", 10, 0}, {"top.txt", 10, 0}})
+	outside := filepath.Join(base, "outside")
+	os.MkdirAll(outside, 0o755)
+	dst := filepath.Join(base, "d")
+	os.MkdirAll(dst, 0o755)
+	os.Symlink(outside, filepath.Join(dst, "sub"))
+	_, s := run(t, []string{src + "/", dst}, opts(filepath.Join(base, "e.txt")))
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Fatalf("wrote %d entries through the symlink, outside the destination", len(entries))
+	}
+	if s.FilesDone != 1 || s.Errors != 1 {
+		t.Fatalf("done %d errors %d (%s)", s.FilesDone, s.Errors, s.LastError)
+	}
+}
+
+// A partial file left by an interrupted run is replaced, not left behind.
+func TestReusesLeftoverPartial(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "s")
+	makeTree(t, src, []spec{{"a.bin", 500000, 0}})
+	dst := filepath.Join(base, "d")
+	os.MkdirAll(dst, 0o755)
+	e := New(&plan.Plan{Dst: dst}, opts(filepath.Join(base, "x.txt")))
+	stale := e.claimTmp(filepath.Join(dst, "a.bin"))
+	os.WriteFile(stale, []byte("old partial"), 0o600)
+	run(t, []string{src + "/", dst}, opts(filepath.Join(base, "e.txt")))
+	sameTree(t, src, dst)
+	noPartials(t, dst)
+}

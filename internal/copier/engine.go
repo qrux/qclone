@@ -19,11 +19,14 @@ import (
 	"hash/fnv"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"tclone/internal/devstat"
@@ -183,12 +186,15 @@ type Engine struct {
 	jobs    chan job
 	opStart []atomic.Int64 // per worker: unix nanos of the op in flight, 0 when idle
 
-	mu     sync.Mutex
-	active map[*file]struct{}
-	dirs   []dirAttr
-	seen   map[string]struct{}
-	devs   []*devWatch
-	srcDev *devWatch // the one source disk, when there is exactly one
+	mu      sync.Mutex
+	active  map[*file]struct{}
+	dirs    []dirAttr
+	seen    map[string]struct{}
+	fold    bool            // the destination ignores letter case
+	tmps    map[string]bool // temporary names in use this run (folded)
+	scanEnd chan struct{}
+	devs    []*devWatch
+	srcDev  *devWatch // the one source disk, when there is exactly one
 
 	readFault func(show string, off int64) error // tests only
 }
@@ -207,7 +213,9 @@ func New(p *plan.Plan, opt Options) *Engine {
 		gate:   newGate(opt.Start.Readers),
 		global: rate.New(now),
 		active: map[*file]struct{}{},
-		jobs:   make(chan job, opt.Tuner.MaxReaders),
+		tmps:   map[string]bool{},
+		fold:   !caseSensitive(existingAncestor(p.Dst)),
+		jobs:   make(chan job), // unbuffered: each chunk is sized at hand-off, so a new chunk size applies at once
 	}
 	e.opStart = make([]atomic.Int64, opt.Tuner.MaxReaders)
 	s := e.tuner.Setting()
@@ -297,7 +305,11 @@ func (e *Engine) Run(ctx context.Context) error {
 	}()
 
 	var wg sync.WaitGroup
-	go e.scan(ctx)
+	e.scanEnd = make(chan struct{})
+	go func() {
+		defer close(e.scanEnd)
+		e.scan(ctx)
+	}()
 	go e.dispatch(ctx)
 	for i := 0; i < e.opt.Tuner.MaxReaders; i++ {
 		wg.Add(1)
@@ -313,6 +325,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.control(stop)
 	}()
 	wg.Wait()
+	<-e.scanEnd // nothing may log after Run returns
 	close(stop)
 	<-ctlDone
 	if parent.Err() != nil {
@@ -330,17 +343,16 @@ func (e *Engine) scan(ctx context.Context) {
 		e.scanning.Store(false)
 		e.q.close()
 	}()
-	plan.Walk(ctx, e.plan, func(en plan.Entry) {
+	plan.Walk(ctx, e.plan, func(en plan.Entry) bool {
 		if en.Err != nil {
 			e.logErr("scan", en.Src, en.Err)
-			return
+			return false
 		}
 		m := en.Info.Mode()
 		switch {
 		case m.IsDir():
-			if err := os.MkdirAll(en.Dst, 0o755); err != nil {
-				e.logErr("mkdir", en.Dst, err)
-				return
+			if !e.prepareDir(en) {
+				return false
 			}
 			e.dirsSeen.Add(1)
 			e.mu.Lock()
@@ -348,31 +360,68 @@ func (e *Engine) scan(ctx context.Context) {
 			e.mu.Unlock()
 		case m.IsRegular():
 			if e.seen != nil {
+				key := e.key(en.Dst)
 				e.mu.Lock()
-				_, dup := e.seen[en.Dst]
-				e.seen[en.Dst] = struct{}{}
+				_, dup := e.seen[key]
+				e.seen[key] = struct{}{}
 				e.mu.Unlock()
 				if dup {
 					e.logErr("skip", en.Src, fmt.Errorf("an earlier source already copies to %s", en.Dst))
-					return
+					return true
 				}
 			}
 			size := en.Info.Size()
 			if fi, err := os.Lstat(en.Dst); err == nil && fi.Mode().IsRegular() && fi.Size() == size && near(fi.ModTime(), en.Info.ModTime(), e.opt.ModifyWindow) {
 				e.filesSkipped.Add(1)
 				e.bytesSkipped.Add(size)
-				return
+				return true
 			}
-			f := &file{show: en.Show, src: en.Src, dst: en.Dst, tmp: tmpName(en.Dst), size: size, mode: m, mtime: en.Info.ModTime()}
+			f := &file{show: en.Show, src: en.Src, dst: en.Dst, size: size, mode: m, mtime: en.Info.ModTime()}
 			e.filesTotal.Add(1)
 			e.bytesTotal.Add(size)
 			e.q.push(f)
 		case m&fs.ModeSymlink != 0:
 			e.copyLink(en)
+			return true
 		default:
 			e.logErr("skip", en.Src, fmt.Errorf("not copied: %s", kindOf(m)))
 		}
+		return true
 	})
+}
+
+// prepareDir makes the destination directory for en, or checks the one that's
+// there. Below the destination root it must be a real directory: a symlink
+// there (say, from an earlier copy of a link) would lead writes outside the
+// destination, so that subtree is skipped. It is made writable for the run;
+// fixDirs gives it the source's mode at the end, so a read-only source
+// directory doesn't block a rerun from retrying files that failed.
+func (e *Engine) prepareDir(en plan.Entry) bool {
+	if en.Rel != "" {
+		if fi, err := os.Lstat(en.Dst); err == nil && !fi.IsDir() {
+			e.logErr("mkdir", en.Dst, fmt.Errorf("exists and is not a directory (%s); not copying into it", fi.Mode().Type()))
+			return false
+		}
+	}
+	if err := os.MkdirAll(en.Dst, 0o755); err != nil {
+		e.logErr("mkdir", en.Dst, err)
+		return false
+	}
+	if fi, err := os.Stat(en.Dst); err == nil && fi.Mode().Perm()&0o700 != 0o700 {
+		if err := os.Chmod(en.Dst, fi.Mode().Perm()|0o700); err != nil {
+			e.logErr("chmod", en.Dst, err)
+		}
+	}
+	return true
+}
+
+// key is how a destination path is compared with others: folded on a disk
+// that ignores letter case.
+func (e *Engine) key(p string) string {
+	if e.fold {
+		return strings.ToLower(p)
+	}
+	return p
 }
 
 func near(a, b time.Time, window time.Duration) bool {
@@ -395,11 +444,30 @@ func kindOf(m fs.FileMode) string {
 	return "special file"
 }
 
-// tmpName is the hidden file a copy is written to before it's renamed into place.
-func tmpName(dst string) string {
+// claimTmp picks the hidden file a copy is written to before it's renamed
+// into place: .tclone-<hash of the name>.part beside the destination. The name
+// is the same from run to run, so a rerun replaces its own leftover from an
+// interrupted run. Within one run each claim is unique: if another file in
+// flight already holds that name (two names that differ only by case, on a
+// disk that ignores case), a numbered one is used.
+func (e *Engine) claimTmp(dst string) string {
 	h := fnv.New64a()
 	io.WriteString(h, filepath.Base(dst))
-	return filepath.Join(filepath.Dir(dst), fmt.Sprintf(".tclone-%012x.part", h.Sum64()&0xffffffffffff))
+	base := filepath.Join(filepath.Dir(dst), fmt.Sprintf(".tclone-%012x", h.Sum64()&0xffffffffffff))
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	name := base + ".part"
+	for n := 2; e.tmps[strings.ToLower(name)]; n++ {
+		name = fmt.Sprintf("%s-%d.part", base, n)
+	}
+	e.tmps[strings.ToLower(name)] = true
+	return name
+}
+
+func (e *Engine) releaseTmp(name string) {
+	e.mu.Lock()
+	delete(e.tmps, strings.ToLower(name))
+	e.mu.Unlock()
 }
 
 func (e *Engine) copyLink(en plan.Entry) {
@@ -412,7 +480,8 @@ func (e *Engine) copyLink(en plan.Entry) {
 		e.filesSkipped.Add(1)
 		return
 	}
-	tmp := tmpName(en.Dst)
+	tmp := e.claimTmp(en.Dst)
+	defer e.releaseTmp(tmp)
 	os.Remove(tmp) // a leftover of tclone's own, from an earlier run
 	if err := os.Symlink(target, tmp); err != nil {
 		e.logErr("link", en.Dst, err)
@@ -484,12 +553,16 @@ func (e *Engine) worker(ctx context.Context, id int) {
 			continue
 		}
 		t0 := time.Now()
-		e.opStart[id].Store(t0.UnixNano())
+		// Monotonic, from the run's start (+1 so 0 means idle): the wall
+		// clock can jump, and stands still neither while the Mac sleeps.
+		e.opStart[id].Store(int64(t0.Sub(e.start)) + 1)
 		n := e.copyChunk(ctx, j, &buf)
 		t1 := time.Now()
+		// Record before the op stops counting as in flight, so no window
+		// can be closed without it.
+		e.tuner.Record(tuner.Op{Start: t0.Sub(e.start), End: t1.Sub(e.start), Bytes: int64(n)})
 		e.opStart[id].Store(0)
 		e.gate.release()
-		e.tuner.Record(tuner.Op{Start: t0.Sub(e.start), End: t1.Sub(e.start), Bytes: int64(n)})
 		e.release(j.f)
 	}
 }
@@ -501,9 +574,17 @@ func (e *Engine) open(f *file) error {
 			f.openErr = err
 			return
 		}
-		df, err := os.OpenFile(f.tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		f.tmp = e.claimTmp(f.dst)
+		df, err := os.OpenFile(f.tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, fs.ErrExist) {
+			// Not in use this run (claimTmp says so): tclone's own leftover from an earlier one.
+			os.Remove(f.tmp)
+			df, err = os.OpenFile(f.tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		}
 		if err != nil {
 			sf.Close()
+			e.releaseTmp(f.tmp)
+			f.tmp = ""
 			f.openErr = err
 			return
 		}
@@ -541,7 +622,11 @@ func (e *Engine) copyChunk(ctx context.Context, j job, buf *[]byte) int {
 			err = fmt.Errorf("file shrank to %d bytes while being copied (was %d)", j.off+int64(n), f.size)
 			break
 		}
-		if attempt >= e.opt.Retries || ctx.Err() != nil {
+		if ctx.Err() != nil {
+			f.canceled.Store(true)
+			return 0
+		}
+		if attempt >= e.opt.Retries {
 			err = fmt.Errorf("%w (%d tries)", err, attempt)
 			break
 		}
@@ -549,6 +634,8 @@ func (e *Engine) copyChunk(ctx context.Context, j job, buf *[]byte) int {
 		select {
 		case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
 		case <-ctx.Done():
+			f.canceled.Store(true)
+			return 0
 		}
 	}
 	e.readBytes.Add(int64(n))
@@ -624,6 +711,9 @@ func (e *Engine) finish(f *file) {
 		f.df.Close()
 		os.Remove(f.tmp) // tclone's own partial file
 	}
+	if f.tmp != "" {
+		e.releaseTmp(f.tmp)
+	}
 	switch {
 	case failed:
 		f.errMu.Lock()
@@ -642,6 +732,12 @@ func (e *Engine) finish(f *file) {
 // install gives the finished temporary file its mode and times and renames it into place.
 func (e *Engine) install(f *file) error {
 	err := f.df.Chmod(f.mode.Perm() | f.mode&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky))
+	if err == nil {
+		// Data reaches the disk before the name does, so a crash can't leave a
+		// complete-looking file (right size and time, so skipped next run)
+		// with missing data. Plain fsync, not F_FULLFSYNC: the cost stays small.
+		err = syscall.Fsync(int(f.df.Fd()))
+	}
 	if cerr := f.df.Close(); err == nil {
 		err = cerr
 	}
@@ -728,17 +824,17 @@ func (e *Engine) starved(now time.Time) bool {
 	}
 	left := e.bytesTotal.Load() - e.bytesDone.Load() - e.bytesFailed.Load()
 	r, ok := e.global.Rate(now)
-	return ok && float64(left) < r*20
+	return ok && float64(left) < r*10
 }
 
 func (e *Engine) oldest(now time.Time) time.Duration {
-	o := now.UnixNano()
+	o := int64(now.Sub(e.start))
 	for i := range e.opStart {
-		if s := e.opStart[i].Load(); s != 0 && s < o {
-			o = s
+		if s := e.opStart[i].Load(); s != 0 && s-1 < o {
+			o = s - 1
 		}
 	}
-	return time.Unix(0, o).Sub(e.start)
+	return time.Duration(o)
 }
 
 // pollDevices refreshes each disk's rates about once a second. Like the main
@@ -809,6 +905,9 @@ func (e *Engine) Snapshot() Snapshot {
 	}
 	s.Rate, s.RateOK = e.global.Rate(now)
 	s.Avg, _ = e.global.Average(now)
+	// The peak is sampled ten times a second; a run shorter than that, or the
+	// moment now, may be higher.
+	s.Peak = math.Max(s.Peak, math.Max(s.Rate, s.Avg))
 	s.Idle = e.global.Idle(now)
 	if e.opt.Errors != nil {
 		s.Errors = e.opt.Errors.Count()

@@ -147,6 +147,9 @@ func Gain(g float64) string {
 
 // TruncLeft keeps the end of s within n characters: "...hotos/IMG_4400.CR2".
 func TruncLeft(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	r := []rune(s)
 	if len(r) <= n {
 		return s
@@ -159,6 +162,9 @@ func TruncLeft(s string, n int) string {
 
 // TruncRight keeps the start of s within n characters.
 func TruncRight(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	r := []rune(s)
 	if len(r) <= n {
 		return s

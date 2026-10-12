@@ -18,6 +18,7 @@ type ErrorLog struct {
 	count   int64
 	last    string
 	openErr error
+	closed  bool
 }
 
 // DefaultErrorPath is <timestamp>-tclone-errors.txt in the current directory.
@@ -41,7 +42,7 @@ func (l *ErrorLog) Log(op, path string, err error) {
 	defer l.mu.Unlock()
 	l.count++
 	l.last = fmt.Sprintf("%s %s: %v", op, path, err)
-	if l.f == nil && l.openErr == nil {
+	if l.f == nil && l.openErr == nil && !l.closed {
 		l.f, l.openErr = os.OpenFile(l.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 		if l.openErr == nil {
 			l.f.WriteString(l.header)
@@ -80,6 +81,7 @@ func (l *ErrorLog) WriteErr() error {
 func (l *ErrorLog) Close() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.closed = true
 	if l.f != nil {
 		fmt.Fprintf(l.f, "# stopped %s, %d errors\n", time.Now().Format(time.RFC3339), l.count)
 		l.f.Close()

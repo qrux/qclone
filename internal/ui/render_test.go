@@ -104,10 +104,17 @@ func TestFramesFitEveryTerminal(t *testing.T) {
 		}
 		h.Record(s.Start.Add(time.Duration(i)*time.Second), r, true, 2+(i/20%2)*11)
 	}
-	for _, size := range [][2]int{{40, 12}, {60, 20}, {80, 24}, {100, 40}, {132, 50}, {200, 60}, {300, 100}} {
+	sizes := [][2]int{{80, 24}, {100, 40}, {132, 50}, {200, 60}, {300, 100}}
+	for w := 20; w < 80; w++ { // every narrow width: no panics, nothing too wide
+		sizes = append(sizes, [2]int{w, 10 + w/3})
+	}
+	for _, size := range sizes {
 		for _, color := range []bool{false, true} {
-			f := Frame{W: size[0], H: size[1], Color: color, Sources: []string{"/Volumes/Old/photos", "/Volumes/Old/video/"}, Dst: "/Users/q/rescue"}
-			checkFrame(t, Render(f, s, h), min(size[0], 160), size[1], fmt.Sprintf("%dx%d color=%v", size[0], size[1], color))
+			for _, done := range []bool{false, true} {
+				s.Done, s.Canceled = done, done
+				f := Frame{W: size[0], H: size[1], Color: color, Sources: []string{"/Volumes/Old/photos", "/Volumes/Old/video/"}, Dst: "/Users/q/rescue"}
+				checkFrame(t, Render(f, s, h), min(size[0], 160), size[1], fmt.Sprintf("%dx%d color=%v done=%v", size[0], size[1], color, done))
+			}
 		}
 	}
 }

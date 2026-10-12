@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -66,7 +68,7 @@ func parseSize(s string) (int, error) {
 	return n * mult, nil
 }
 
-func run(args []string) int {
+func run(args []string) (code int) {
 	started := time.Now()
 	fs := flag.NewFlagSet("tclone", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -114,6 +116,11 @@ func run(args []string) int {
 	}
 	if *maxReaders < 1 || *maxReaders > 256 {
 		return bad("--max-readers must be 1 to 256")
+	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if !set["readers"] && !set["j"] && readers > *maxReaders {
+		readers = *maxReaders // only the default was over the cap
 	}
 	if readers < 1 || readers > *maxReaders {
 		return bad("--readers must be 1 to --max-readers (%d)", *maxReaders)
@@ -185,6 +192,20 @@ func run(args []string) int {
 	})
 	hist := ui.NewHistory(eng.Snapshot().Start)
 	var tui *ui.TUI
+	// A bug in the display must not leave the terminal unusable or dump a
+	// trace on the screen: restore the terminal and put the trace in the
+	// error file.
+	defer func() {
+		if r := recover(); r != nil {
+			if tui != nil {
+				tui.Restore()
+			}
+			errLog.Log("panic", "tclone", fmt.Errorf("%v\n%s", r, debug.Stack()))
+			errLog.Close()
+			fmt.Printf("tclone: stopped by an internal error; details in %s\n", filepath.Base(errLog.Path()))
+			code = 1
+		}
+	}()
 	if tty != nil {
 		var srcs []string
 		for _, r := range p.Roots {

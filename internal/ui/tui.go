@@ -165,7 +165,11 @@ func Summary(s copier.Snapshot) []string {
 	if s.Canceled {
 		head = "tclone: canceled after " + el
 	}
-	l1 := fmt.Sprintf("%s. Copied %s in %s files", head, Bytes(s.BytesDone), Count(s.FilesDone))
+	files := Count(s.FilesDone) + " files"
+	if s.FilesDone == 1 {
+		files = "1 file"
+	}
+	l1 := fmt.Sprintf("%s. Copied %s in %s", head, Bytes(s.BytesDone), files)
 	if s.Avg > 0 {
 		l1 += fmt.Sprintf(" (avg %s, peak %s)", Rate(s.Avg), Rate(s.Peak))
 	}

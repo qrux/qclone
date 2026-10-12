@@ -71,7 +71,9 @@ func Resolve(args []string) (*Plan, error) {
 	for i := range p.Roots {
 		for j := i + 1; j < len(p.Roots); j++ {
 			a, b := p.Roots[i], p.Roots[j]
-			if within(a.Dst, b.Dst) || within(b.Dst, a.Dst) {
+			// Folded: on a case-insensitive disk Docs and docs are one folder.
+			fa, fb := strings.ToLower(a.Dst), strings.ToLower(b.Dst)
+			if within(fa, fb) || within(fb, fa) {
 				if a.Kind != Dir && b.Kind != Dir && a.Dst == b.Dst {
 					return nil, fmt.Errorf("%s and %s would both be copied to %s", a.Arg, b.Arg, a.Dst)
 				}
@@ -126,46 +128,47 @@ func resolveOne(arg, dst string) (Root, error) {
 	return r, nil
 }
 
-// checkInside refuses to copy a directory into itself.
+// checkInside refuses any root whose source and destination overlap: the
+// destination inside the source (the copy would copy itself, forever), or the
+// source inside its destination (the copy would overwrite what it is reading).
+// It compares by file identity, not by name, so letter case, Unicode forms,
+// firmlinks and symlinks can't get past it.
 func checkInside(p *Plan) error {
-	d, err := realish(p.Dst)
-	if err != nil {
-		return err
-	}
 	for _, r := range p.Roots {
-		if r.Kind != Dir {
-			continue
-		}
-		s, err := filepath.EvalSymlinks(r.Src)
+		src, err := os.Stat(r.Src)
 		if err != nil {
 			return err
 		}
-		if s, err = filepath.Abs(s); err != nil {
-			return err
+		if under(r.Dst, src) {
+			if r.Kind == Dir {
+				return fmt.Errorf("destination %s is inside source %s", r.Dst, r.Arg)
+			}
+			return fmt.Errorf("%s would be copied onto itself", r.Arg)
 		}
-		if within(d, s) {
-			return fmt.Errorf("destination %s is inside source %s", p.Dst, r.Arg)
+		if r.Kind != Dir {
+			continue
+		}
+		if dst, err := os.Stat(r.Dst); err == nil && under(r.Src, dst) {
+			return fmt.Errorf("source %s is inside its destination %s", r.Arg, r.Dst)
 		}
 	}
 	return nil
 }
 
-// realish resolves the longest existing prefix of path and appends the rest.
-func realish(path string) (string, error) {
+// under reports whether path, or any directory above it, is the file target.
+func under(path string, target os.FileInfo) bool {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", err
+		return false
 	}
-	rest := ""
 	for cur := abs; ; {
-		if r, err := filepath.EvalSymlinks(cur); err == nil {
-			return filepath.Join(r, rest), nil
+		if fi, err := os.Stat(cur); err == nil && os.SameFile(fi, target) {
+			return true
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
-			return abs, nil
+			return false
 		}
-		rest = filepath.Join(filepath.Base(cur), rest)
 		cur = parent
 	}
 }
@@ -193,9 +196,13 @@ type Entry struct {
 }
 
 // Walk visits every root in order, parents before children. A directory that
-// can't be read is reported with Err set and skipped; the walk goes on.
-func Walk(ctx context.Context, p *Plan, visit func(Entry)) error {
+// can't be read is reported with Err set and skipped; the walk goes on. When
+// visit returns false for a directory, its contents are skipped.
+func Walk(ctx context.Context, p *Plan, visit func(Entry) bool) error {
 	for i, r := range p.Roots {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if r.Kind != Dir {
 			fi, err := os.Lstat(r.Src)
 			visit(Entry{Root: i, Src: r.Src, Dst: r.Dst, Show: r.Label, Info: fi, Err: err})
@@ -220,8 +227,8 @@ func Walk(ctx context.Context, p *Plan, visit func(Entry)) error {
 			if err == nil {
 				e.Info, e.Err = d.Info()
 			}
-			visit(e)
-			if e.Err != nil && d != nil && d.IsDir() {
+			keep := visit(e)
+			if d != nil && d.IsDir() && (e.Err != nil || !keep) {
 				return fs.SkipDir
 			}
 			return nil

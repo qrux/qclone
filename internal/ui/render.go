@@ -36,8 +36,8 @@ func Render(f Frame, s copier.Snapshot, h *History) []string {
 	if W > 160 {
 		W = 160
 	}
-	if W < 40 {
-		W = 40
+	if W < 20 {
+		W = 20
 	}
 	r := &renderer{f: f, s: s, h: h, W: W}
 
@@ -473,6 +473,8 @@ func decisionText(d tuner.Decision) (string, style) {
 		return "not enough queued work to test", gray
 	case "stalled", "stuck":
 		return "reads stalled; test void", yellow
+	case "implausible":
+		return "test straddled fast and slow regions; void", yellow
 	}
 	return what + ": " + d.Note, plain
 }

@@ -235,17 +235,18 @@ type regime struct {
 
 // Thresholds, as log ratios.
 var (
-	upGain      = math.Log(1.05) // more readers must buy 5%
-	downLoss    = math.Log(1.02) // fewer readers may cost up to 2%
-	downWorst   = math.Log(1.06) // ...and no single arm may be 6% worse
-	chunkGain   = math.Log(1.03) // a bigger chunk must buy 3%
-	chunkLoss   = math.Log(1.02) // a smaller chunk may cost up to 2% (finer progress, faster rounds)
-	driftLimit  = math.Log(2.5)  // A arms this far apart: the drive changed region mid-round
-	regimeShift = math.Log(2.5)  // steady speed this far from the last round: a new region
-	regimeMatch = math.Log(12)   // a remembered region this close is the same one
-	earlyGap    = math.Log(1.25) // A C A already shows 25% either way: decide now
-	slowOp      = 0.5            // seconds per read above which the chunk is not grown
-	earlyStable = math.Log(1.2)  // ...provided the two A arms agree within 20%
+	upGain         = math.Log(1.05) // more readers must buy 5%
+	downLoss       = math.Log(1.02) // fewer readers may cost up to 2%
+	downWorst      = math.Log(1.06) // ...and no single arm may be 6% worse
+	chunkGain      = math.Log(1.03) // a bigger chunk must buy 3%
+	chunkLoss      = math.Log(1.02) // a smaller chunk may cost up to 2% (finer progress, faster rounds)
+	driftLimit     = math.Log(2.5)  // A arms this far apart: the drive changed region mid-round
+	regimeShift    = math.Log(2.5)  // steady speed this far from the last round: a new region
+	regimeMatch    = math.Log(12)   // a remembered region this close is the same one
+	earlyGap       = math.Log(1.25) // A C A already shows 25% either way: decide now
+	slowOp         = 0.5            // seconds per read above which the chunk is not grown
+	plausibleSlack = math.Log(1.15)
+	earlyStable    = math.Log(1.2) // ...provided the two A arms agree within 20%
 )
 
 // Tuner is safe for concurrent use: Record from the workers, Step from one control loop.
@@ -638,6 +639,10 @@ func (t *Tuner) evaluate(p Probe) {
 	}
 	s1 := c1 - (a1+a2)/2
 	s2 := c2 - (a2+a3)/2
+	if !t.plausible(s1) || !t.plausible(s2) {
+		t.inconclusive(p, "implausible")
+		return
+	}
 	mean := (s1 + s2) / 2
 	worst := math.Min(s1, s2)
 	noise := math.Abs(a1-2*a2+a3) / 2
@@ -710,6 +715,9 @@ func (t *Tuner) early(p Probe) bool {
 		return false
 	}
 	s := c1 - (a1+a2)/2
+	if !t.plausible(s) {
+		return false // the full round will throw it out
+	}
 	switch {
 	case s > earlyGap:
 		t.closeOpen(p)
@@ -721,6 +729,18 @@ func (t *Tuner) early(p Probe) bool {
 		return true
 	}
 	return false
+}
+
+// plausible: a score can't exceed what the change itself could cause. Twice
+// the readers or twice the chunk can at most double throughput (and halving
+// can at most halve it). A bigger jump means the C arm fell into a different
+// region of the drive than the A arms around it.
+func (t *Tuner) plausible(score float64) bool {
+	a, c := float64(t.cur.Readers), float64(t.cand.Readers)
+	if t.dim == DimChunk {
+		a, c = float64(t.cur.Chunk), float64(t.cand.Chunk)
+	}
+	return math.Abs(score) <= math.Abs(math.Log(c/a))+plausibleSlack
 }
 
 func (t *Tuner) closeOpen(p Probe) {

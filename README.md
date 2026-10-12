@@ -14,12 +14,23 @@ tclone [flags] SRC [SRC...] DST
   contents. A file source lands in `DST` under its own name; a symlink source
   is copied as a link, unless it has a trailing slash.
 - **Many sources.** Each one is resolved by the rule above. If two of them would
-  write the same file, the second one is skipped and logged.
+  write the same file, the second one is skipped and logged. On a destination
+  that ignores letter case (most Mac volumes), `Docs/x` and `docs/x` count as
+  the same file.
+- **No copying into itself.** A source whose destination is inside it, or that is
+  itself inside its destination, is refused. The check compares the folders
+  themselves, not their names, so case, Unicode forms and links can't slip
+  past it.
 - **Like `rclone copy`:** files already at the destination with the same size and
   modification time (within 1 s) are skipped, so a rerun picks up where the last
   one stopped. Each file is written to a hidden `.tclone-*.part` file next to its
-  destination and renamed into place only when complete. Modes, modification
-  times, symlinks and empty directories are copied.
+  destination, synced to disk, and only then renamed into place. A crash can't
+  leave a file that looks complete (and would be skipped next time) but isn't.
+  Modes, modification times, symlinks and empty directories are copied.
+  Directories get their modes at the end, so a read-only source folder doesn't
+  stop a rerun from retrying a file that failed in it. A symlink found where
+  the destination needs a folder is never followed: that folder is skipped and
+  logged.
 - **Errors never go to the terminal.** They go to `<timestamp>-tclone-errors.txt`
   in the current directory (or `--errors FILE`). The file is created only when
   the first error happens. Exit status: 0 done, 1 some errors, 2 bad arguments,
@@ -56,7 +67,10 @@ arms in the order A C A C A, where A is the current setting and C is a
 candidate. Each C is scored against the mean of the A arms on either side,
 which cancels any steady drift in the drive's speed. A round whose A arms
 disagree badly (the copy moved to a different region mid-test) doesn't count.
-When A C A alone already shows a 25% difference, the round ends early.
+When A C A alone already shows a 25% difference, the round ends early. A
+verdict is also thrown out if it claims more than the change could cause.
+Twice the readers can at most double throughput, so a bigger jump means the
+candidate's arm fell into a faster or slower region than the arms around it.
 
 - More readers must buy at least 5% to be kept. Fewer readers are kept if they
   cost no more than 2%: fewer reads in flight is easier on a struggling drive.

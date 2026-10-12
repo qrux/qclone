@@ -89,6 +89,9 @@ func TestRefusals(t *testing.T) {
 		{j("link") + "/", j("source", "x")},                    // into itself through a link
 		{j("source"), j("lone.txt")},                           // destination is a file
 		{j("lone.txt"), j("other") + "/../lone.txt", j("dst")}, // two files, same name
+		{j("source"), j("SOURCE", "backup")},                   // into itself, other case (APFS ignores case)
+		{j("source", "sub") + "/", j("source")},                // contents source inside its destination
+		{j("lone.txt"), base},                                  // a file onto itself
 	}
 	for _, args := range bad {
 		if _, err := Resolve(args); err == nil {
@@ -120,12 +123,13 @@ func TestWalkMultipleRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got []string
-	Walk(context.Background(), p, func(e Entry) {
+	Walk(context.Background(), p, func(e Entry) bool {
 		if e.Err != nil {
 			t.Fatalf("walk error at %s: %v", e.Src, e.Err)
 		}
 		rel, _ := filepath.Rel(dst, e.Dst)
 		got = append(got, rel+" ("+e.Show+")")
+		return true
 	})
 	sort.Strings(got)
 	want := []string{". ()", "c.txt (c.txt)", "lone.txt (lone.txt)", "source (source)", "source/a.txt (source/a.txt)", "source/sub (source/sub)", "source/sub/b.txt (source/sub/b.txt)"}
@@ -141,10 +145,11 @@ func TestWalkFollowsLinkWithSlash(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := 0
-	Walk(context.Background(), p, func(e Entry) {
+	Walk(context.Background(), p, func(e Entry) bool {
 		if e.Err == nil && e.Info.Mode().IsRegular() {
 			n++
 		}
+		return true
 	})
 	if n != 2 {
 		t.Fatalf("found %d files through link/, want 2", n)
@@ -161,12 +166,13 @@ func TestWalkReportsUnreadableDirectory(t *testing.T) {
 	defer os.Chmod(locked, 0o755)
 	p, _ := Resolve([]string{filepath.Join(base, "source"), filepath.Join(base, "dst")})
 	errs, files := 0, 0
-	Walk(context.Background(), p, func(e Entry) {
+	Walk(context.Background(), p, func(e Entry) bool {
 		if e.Err != nil {
 			errs++
 		} else if e.Info.Mode().IsRegular() {
 			files++
 		}
+		return true
 	})
 	if errs != 1 || files != 1 {
 		t.Fatalf("errors %d files %d; want 1 and 1", errs, files)
