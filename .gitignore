@@ -1,0 +1,10 @@
+# Per-machine links into ~/jorp/tclone (PROJ_META.md); never committed.
+/_*
+
+# Build output and demo data (make build, make demo).
+/build/
+
+# Error files from running tclone in the repo folder.
+/*-tclone-errors.txt
+
+.DS_Store
