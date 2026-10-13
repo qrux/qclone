@@ -338,7 +338,7 @@ func (r *renderer) chart(rows, readerRows int) []*line {
 	cols := r.chartCols()
 	cs := r.h.columns(cols, spc(cols, r.h.Seconds()))
 	lo, hi := math.Inf(1), 0.0
-	maxR := r.s.Tuner.Applied.Readers
+	maxR := r.s.Readers
 	// The scale only ever widens: a range once shown stays, so the chart
 	// doesn't jump about as fast and slow stretches scroll in and out.
 	if r.h.yHi > 0 {
@@ -469,64 +469,46 @@ func ladder(lo, hi float64, rows int) []float64 {
 	return b[len(b)-1-rows:] // even decades don't fit: keep the top
 }
 
-func settingText(s tuner.Setting) string {
-	return fmt.Sprintf("%d readers x %s, %s", s.Readers, Chunk(s.Chunk), plural(s.Files, "file"))
+// readersText is what's in flight: "4 reads x 256K" (the tuner's number) while
+// nothing is stuck, otherwise the reads flying and stuck right now, as in
+// "2 flying + 16 stuck reads x 256K (stuck room full)".
+func readersText(s copier.Snapshot) string {
+	if s.Stuck == 0 {
+		return fmt.Sprintf("%s x %s", plural(s.Tuner.Readers, "read"), Chunk(s.Chunk))
+	}
+	flying := s.Reading - s.Stuck
+	if flying < 0 {
+		flying = 0
+	}
+	t := fmt.Sprintf("%d flying + %d stuck reads x %s", flying, s.Stuck, Chunk(s.Chunk))
+	if s.MaxStuck > 0 && s.Stuck >= s.MaxStuck {
+		t += " (stuck room full)"
+	}
+	return t
 }
 
-func armLabel(dim int, s tuner.Setting) string {
-	switch dim {
-	case tuner.DimChunk:
-		return Chunk(s.Chunk)
-	case tuner.DimFiles:
-		return plural(s.Files, "file")
-	}
-	return fmt.Sprintf("%d", s.Readers)
-}
-
-func trialText(dim int, from, to tuner.Setting) string {
-	if dim == tuner.DimFiles {
-		dir := "more"
-		if to.Files < from.Files {
-			dir = "fewer"
-		}
-		return fmt.Sprintf("%s files at once %d -> %d", dir, from.Files, to.Files)
-	}
-	if dim == tuner.DimChunk {
-		dir := "bigger"
-		if to.Chunk < from.Chunk {
-			dir = "smaller"
-		}
-		return fmt.Sprintf("%s reads %s -> %s", dir, Chunk(from.Chunk), Chunk(to.Chunk))
-	}
+func trialText(from, to int) string {
 	dir := "more"
-	if to.Readers < from.Readers {
+	if to < from {
 		dir = "fewer"
 	}
-	return fmt.Sprintf("%s readers %d -> %d", dir, from.Readers, to.Readers)
+	return fmt.Sprintf("%s flying reads %d -> %d", dir, from, to)
 }
 
 func decisionText(d tuner.Decision) (string, style) {
-	what := trialText(d.Dim, d.From, d.To)
+	what := trialText(d.From, d.To)
 	switch d.Note {
 	case "kept":
 		return fmt.Sprintf("%s: %s, kept", what, Gain(d.Gain)), green
-	case "rejected":
+	case "not kept":
 		if d.Gain >= 0 {
 			return fmt.Sprintf("%s: %s, not worth it", what, Gain(d.Gain)), plain
 		}
-		return fmt.Sprintf("%s: %s, dropped", what, Gain(d.Gain)), plain
-	case "jumped":
-		return "new region: jumped to " + settingText(d.To) + " (what worked here before)", cyan
-	case "region changed":
-		return "drive changed speed mid-test (new region); test void", yellow
-	case "disk busy":
-		return "something else used the disk; test void", yellow
+		return fmt.Sprintf("%s: %s, slower", what, Gain(d.Gain)), plain
+	case "too few flying reads":
+		return "too few flying reads to test " + what, gray
 	case "starved":
 		return "not enough queued work to test", gray
-	case "stalled", "stuck":
-		return "reads stalled; test void", yellow
-	case "implausible":
-		return "test straddled fast and slow regions; void", yellow
 	}
 	return what + ": " + d.Note, plain
 }
@@ -535,7 +517,7 @@ func (r *renderer) tuner() []*line {
 	st := r.s.Tuner
 	l := r.nl()
 	l.add(bcyan, " TUNER  ")
-	l.add(bold, settingText(st.Applied))
+	l.add(bold, readersText(r.s))
 	l2 := r.nl().pad(labelW)
 	mode := st.Mode
 	if r.s.Done && mode != "fixed" {
@@ -543,59 +525,50 @@ func (r *renderer) tuner() []*line {
 	}
 	switch mode {
 	case "fixed":
-		l.add(gray, "   fixed (--fixed)")
+		l.add(gray, fmt.Sprintf("   fixed at %d flying (--fixed)", st.Readers))
 	case "warming up":
 		l.add(plain, "   warming up")
-	case "probing":
-		l.add(plain, "   testing ").add(byellow, trialText(st.Dim, st.Incumbent, st.Candidate))
-		cur := -1
-		for i, a := range st.Arms {
-			if !a.Final && cur < 0 {
-				cur = i
-			}
-		}
-		for i, a := range st.Arms {
-			lab := armLabel(st.Dim, a.Setting)
+	case "waiting for work":
+		l.add(gray, fmt.Sprintf("   waiting for work, at %d flying", st.Readers))
+	case "measuring", "testing":
+		arm := func(n int, rate float64, final bool) {
+			lab := fmt.Sprintf("[%d: ", n)
 			switch {
-			case a.Final:
-				l2.add(plain, "["+lab+": "+Rate(a.Rate)+"]")
-			case i == cur:
-				l2.add(byellow, "["+lab+": measuring]")
+			case final:
+				l2.add(plain, lab+Rate(rate)+"]")
+			case rate > 0:
+				l2.add(byellow, lab+"measuring, "+Rate(rate)+"]")
 			default:
-				l2.add(gray, "["+lab+"]")
+				l2.add(byellow, lab+"measuring]")
 			}
 			l2.add(plain, " ")
+		}
+		if mode == "measuring" {
+			l.add(plain, fmt.Sprintf("   measuring %s", plural(st.Base, "flying read")))
+			arm(st.Base, st.Rate, false)
+		} else {
+			l.add(plain, "   testing ").add(byellow, trialText(st.Base, st.Candidate))
+			arm(st.Base, st.BaseRate, true)
+			arm(st.Candidate, st.Rate, false)
 		}
 	default:
 		if r.s.Done {
 			l.add(plain, fmt.Sprintf("   finished, after %s", plural(st.Changes, "change")))
 		} else {
-			l.add(plain, "   holding")
+			l.add(plain, fmt.Sprintf("   holding at %d flying", st.Readers))
 		}
-		if st.RestLeft > time.Second && !r.s.Done {
-			l.add(gray, " (next test in "+Ago(st.RestLeft)+")")
+		if st.NextCheck > time.Second && !r.s.Done {
+			l.add(gray, " (next check in "+Ago(st.NextCheck)+")")
 		}
+	}
+	if mode != "measuring" && mode != "testing" {
 		if n := len(st.History); n > 0 {
 			d := st.History[n-1]
 			txt, sty := decisionText(d)
 			l2.add(gray, "last: ").add(sty, txt).add(gray, ", "+Ago(r.s.Now.Sub(r.s.Start)-d.At)+" ago")
 		}
 	}
-	if len(st.Regimes) >= 2 && l.w < r.W-20 {
-		var parts []string
-		for _, g := range st.Regimes {
-			p := fmt.Sprintf("%s/s: %dx%s", Short(g.Rate), g.Best.Readers, Chunk(g.Best.Chunk))
-			if g.Current {
-				p += "*"
-			}
-			parts = append(parts, p)
-		}
-		txt := "regions " + strings.Join(parts, "  ")
-		if l.w+3+len(txt) <= r.W {
-			l.right(gray, txt, r.W)
-		}
-	}
-	if st.Changes > 0 && st.Mode != "probing" && !r.s.Done {
+	if st.Changes > 0 && mode != "measuring" && mode != "testing" && !r.s.Done {
 		l2.right(gray, plural(st.Changes, "change"), r.W)
 	}
 	return []*line{l, l2}
@@ -704,7 +677,7 @@ func (r *renderer) files(room int) []*line {
 	head := r.nl().add(bcyan, " FILES  ")
 	switch {
 	case len(s.Active) > 0:
-		head.add(plain, fmt.Sprintf("%d readers on %s", s.Tuner.Applied.Readers, plural(len(s.Active), "file")))
+		head.add(plain, fmt.Sprintf("%s on %s", plural(s.Readers, "read"), plural(len(s.Active), "file")))
 	case s.Done:
 		head.add(plain, "finished")
 	case s.Scanning:

@@ -1,6 +1,7 @@
-// qclone copies directories like rclone copy, but tunes its own parallelism
-// by experiment, shows a rate that never reads zero while data is moving, and
-// keeps errors out of the terminal.
+// qclone copies directories like rclone copy, but keeps reads flowing past
+// ones stuck on slow data, tunes how many reads fly by measuring them, shows a
+// rate that never reads zero while data is moving, and keeps errors out of the
+// terminal.
 package main
 
 import (
@@ -32,16 +33,17 @@ Copies each SRC into the directory DST (created if missing):
 Files already at DST with the same size and modification time are skipped.
 
 flags:
-  -j, --readers N      reads in flight at the start (default 4)
-      --max-readers N  most reads in flight the tuner may use (default 32)
-      --files N        files read at once at the start (default 4); each may hold
-                       up to readers/files of the reads, so one slow file can't
-                       hold them all
-      --chunk SIZE     bytes per read, e.g. 256K, 4M; fixes it (default: tuned, from 256K)
+  -j, --readers N      flying reads at the start (default 4): reads not stuck on
+                       slow data. Doubled while that makes them faster
+      --max-readers N  most flying reads (default 32)
+      --max-stuck N    a read in flight over 50 ms is stuck, and gets room of
+                       its own beside the flying reads, up to N stuck reads
+                       (default 16); 0: stuck reads use up flying ones
+      --chunk SIZE     bytes per read, e.g. 256K, 4M (default 256K)
       --order ORDER    hash (default): by a hash of each path, among the next 1,024
                        files found, to mix old and new data; dfs: depth first,
                        names sorted; dirent: depth first, as the disk lists them
-      --fixed          don't tune: keep --readers, --chunk and --files as given
+      --fixed          don't tune: keep --readers as given
       --errors FILE    where errors go (default: <timestamp>-qclone-errors.txt here)
       --rescue         install files that have unreadable spots, with zeros there
                        (each spot is listed in the error file; a later run
@@ -126,7 +128,7 @@ func run(args []string) (code int) {
 	fs.IntVar(&readers, "readers", 4, "")
 	fs.IntVar(&readers, "j", 4, "")
 	maxReaders := fs.Int("max-readers", 32, "")
-	filesN := fs.Int("files", 4, "")
+	maxStuck := fs.Int("max-stuck", 16, "")
 	orderFlag := fs.String("order", "hash", "")
 	chunkFlag := fs.String("chunk", "", "")
 	fixed := fs.Bool("fixed", false, "")
@@ -180,11 +182,8 @@ func run(args []string) (code int) {
 	if !set["readers"] && !set["j"] && readers > *maxReaders {
 		readers = *maxReaders // only the default was over the cap
 	}
-	if !set["files"] && *filesN > *maxReaders {
-		*filesN = *maxReaders
-	}
-	if *filesN < 1 || *filesN > *maxReaders {
-		return bad("--files must be 1 to --max-readers (%d)", *maxReaders)
+	if *maxStuck < 0 || *maxStuck > 256 {
+		return bad("--max-stuck must be 0 to 256")
 	}
 	order, err := plan.ParseOrder(*orderFlag)
 	if err != nil {
@@ -195,8 +194,7 @@ func run(args []string) (code int) {
 	}
 	cfg := tuner.DefaultConfig()
 	cfg.MaxReaders = *maxReaders
-	cfg.MaxFiles = *maxReaders // more files than reads in flight would idle some
-	start := tuner.Setting{Readers: readers, Chunk: 256 << 10, Files: *filesN}
+	chunk := 256 << 10
 	if *chunkFlag != "" {
 		n, err := parseSize(*chunkFlag)
 		if err != nil {
@@ -205,9 +203,7 @@ func run(args []string) (code int) {
 		if n < 4<<10 || n > 64<<20 {
 			return bad("--chunk must be 4K to 64M")
 		}
-		start.Chunk = n
-		cfg.TuneChunk = false
-		cfg.MinChunk, cfg.MaxChunk = n, n
+		chunk = n
 	}
 	var dev *sim.Device
 	switch *simulate {
@@ -252,8 +248,10 @@ func run(args []string) (code int) {
 	color := tty != nil && !*noColor && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
 
 	eng := copier.New(p, copier.Options{
-		Start:        start,
+		Readers:      readers,
 		Tuner:        cfg,
+		MaxStuck:     *maxStuck,
+		Chunk:        chunk,
 		Fixed:        *fixed,
 		Cached:       *cached,
 		ModifyWindow: time.Second,
@@ -316,7 +314,7 @@ loop:
 			break loop
 		case <-tick.C:
 			s := eng.Snapshot()
-			hist.Record(s.Now, s.Rate, s.RateOK, s.Tuner.Applied.Readers)
+			hist.Record(s.Now, s.Rate, s.RateOK, s.Readers)
 			if tui != nil {
 				tui.Draw(s)
 			}
@@ -326,7 +324,7 @@ loop:
 		}
 	}
 	final := eng.Snapshot()
-	hist.Record(final.Now, final.Rate, final.RateOK, final.Tuner.Applied.Readers)
+	hist.Record(final.Now, final.Rate, final.RateOK, final.Readers)
 	if runErr != nil {
 		errLog.Log("start", p.Dst, runErr)
 		final = eng.Snapshot()

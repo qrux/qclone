@@ -1,10 +1,11 @@
 package copier
 
-// Diagnostics, not tests: they copy the ~1 GB demo tree through the simulated
-// degraded drive and print what the tuner decided (TestDiagTunerDecisions, hash
-// and dfs order) and what pinned settings achieve (TestDiagPinnedSettings).
-// They skip unless QCLONE_DIAG_SRC names the demo tree; run them with
-// `make tuner-diag` (several minutes).
+// A diagnostic, not a test: it copies the ~1 GB demo tree through the simulated
+// degraded drive and prints how long each copy took, what was in flight, and
+// every decision the tuner made: in hash order, in dfs order, and the way
+// rclone copies (4 reads in flight, 1 MiB each, no room for stuck reads, never
+// tuned). It skips unless QCLONE_DIAG_SRC names the demo tree; run it with
+// `make tuner-diag` (a few minutes).
 
 import (
 	"context"
@@ -18,52 +19,66 @@ import (
 	"qclone/internal/tuner"
 )
 
-func TestDiagTunerDecisions(t *testing.T) {
+func TestDiagRuns(t *testing.T) {
 	src := os.Getenv("QCLONE_DIAG_SRC")
 	if src == "" {
 		t.Skip()
 	}
-	for _, order := range []plan.Order{plan.OrderHash, plan.OrderDFS} {
+	cases := []struct {
+		name string
+		set  func(*Options)
+	}{
+		{"hash", func(o *Options) { o.Order = plan.OrderHash }},
+		{"dfs", func(o *Options) { o.Order = plan.OrderDFS }},
+		{"rclone-shape", func(o *Options) { o.Order, o.Fixed, o.MaxStuck, o.Chunk = plan.OrderDFS, true, 0, 1<<20 }},
+	}
+	for _, c := range cases {
 		dst := t.TempDir()
 		o := opts(dst + "/e.txt")
 		o.Tuner = tuner.DefaultConfig()
-		o.Start = tuner.Setting{Readers: 4, Chunk: 256 << 10, Files: 4}
 		o.Sim = sim.NewDevice(sim.Degraded())
-		o.Order = order
-		p, _ := plan.Resolve([]string{src + "/", dst + "/d"})
+		c.set(&o)
+		p, err := plan.Resolve([]string{src + "/", dst + "/d"})
+		if err != nil {
+			t.Fatal(err)
+		}
 		e := New(p, o)
+		done := make(chan struct{})
+		var samples, limit, stuck, reading int
+		go func() {
+			tick := time.NewTicker(100 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-tick.C:
+					s := e.Snapshot()
+					samples++
+					limit += s.Readers
+					stuck += s.Stuck
+					for i := range e.workers {
+						w := &e.workers[i]
+						w.mu.Lock()
+						if w.start >= 0 {
+							reading++
+						}
+						w.mu.Unlock()
+					}
+				}
+			}
+		}()
 		t0 := time.Now()
 		e.Run(context.Background())
-		fmt.Printf("== %s: %.0fs\n", order, time.Since(t0).Seconds())
-		for _, d := range e.tuner.Status(0).History {
-			fmt.Printf("  %6.1fs dim=%d %v -> %v gain=%+.2f %s\n", d.At.Seconds(), d.Dim, d.From, d.To, d.Gain, d.Note)
-		}
-	}
-}
-
-func TestDiagPinnedSettings(t *testing.T) {
-	src := os.Getenv("QCLONE_DIAG_SRC")
-	if src == "" {
-		t.Skip()
-	}
-	for _, order := range []plan.Order{plan.OrderHash, plan.OrderDFS} {
-		for _, r := range []int{4, 8, 16} {
-			for _, files := range []int{1, 4} {
-				dst := t.TempDir()
-				o := opts(dst + "/e.txt")
-				o.Tuner = tuner.DefaultConfig()
-				o.Fixed = true
-				o.Start = tuner.Setting{Readers: r, Chunk: 256 << 10, Files: files}
-				o.Sim = sim.NewDevice(sim.Degraded())
-				o.Order = order
-				p, _ := plan.Resolve([]string{src + "/", dst + "/d"})
-				e := New(p, o)
-				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-				e.Run(ctx)
-				cancel()
-				s := e.Snapshot()
-				fmt.Printf("%-6s readers %2d files %d: %6.1f MB in 20 s (%5.2f MB/s), %d files done\n", order, r, files, float64(e.readBytes.Load())/1e6, float64(e.readBytes.Load())/20e6, s.FilesDone)
-			}
+		el := time.Since(t0)
+		close(done)
+		s := e.Snapshot()
+		n := float64(max(samples, 1))
+		fmt.Printf("== %s: %.0fs, %.1f MB/s, %d files, %d errors\n", c.name, el.Seconds(), float64(s.BytesDone)/el.Seconds()/1e6, s.FilesDone, s.Errors)
+		fmt.Printf("   on average: %.1f reads allowed, %.1f reading, %.1f counted stuck; at most %d stuck; flying reads at the end %d\n",
+			float64(limit)/n, float64(reading)/n, float64(stuck)/n, s.PeakStuck, s.Tuner.Readers)
+		for _, d := range s.Tuner.History {
+			fmt.Printf("   %6.1fs %2d -> %2d flying: %+5.0f%% %s\n", d.At.Seconds(), d.From, d.To, d.Gain*100, d.Note)
 		}
 	}
 }

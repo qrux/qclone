@@ -145,7 +145,7 @@ func StatusLine(s copier.Snapshot) string {
 		Bytes(s.BytesDone) + " of " + Bytes(s.BytesTotal),
 		Count(s.FilesDone) + " of " + Count(s.FilesTotal) + " files",
 		speed,
-		settingText(s.Tuner.Applied),
+		readersText(s),
 		Count(s.Errors) + " errors",
 	}
 	if s.BytesResumed > 0 {
@@ -163,8 +163,8 @@ func StatusLine(s copier.Snapshot) string {
 	return strings.Join(parts, "  ")
 }
 
-// Summary is what's printed when qclone ends: counts, rates and what the
-// tuner learned. No paths, except the error file's name.
+// Summary is what's printed when qclone ends: counts, rates and where the
+// tuner ended. No paths, except the error file's name.
 func Summary(s copier.Snapshot) []string {
 	el := Clock(s.Now.Sub(s.Start))
 	head := "qclone: done in " + el
@@ -194,18 +194,17 @@ func Summary(s copier.Snapshot) []string {
 	l1 += "."
 	out := []string{l1}
 	st := s.Tuner
-	l2 := fmt.Sprintf("qclone: ended at %s", settingText(st.Applied))
+	l2 := fmt.Sprintf("qclone: ended at %s x %s", plural(st.Readers, "flying read"), Chunk(s.Chunk))
 	if st.Mode == "fixed" {
 		l2 += " (fixed)"
 	} else {
 		l2 += " after " + plural(st.Changes, "change")
 	}
-	if len(st.Regimes) > 1 {
-		var parts []string
-		for _, g := range st.Regimes {
-			parts = append(parts, fmt.Sprintf("%s regions -> %s", Rate(g.Rate), settingText(g.Best)))
-		}
-		l2 += "; learned " + strings.Join(parts, ", ")
+	switch {
+	case s.PeakStuck > s.MaxStuck:
+		l2 += fmt.Sprintf("; up to %d reads stuck at once (%d in their own room, the rest in the flying reads')", s.PeakStuck, s.MaxStuck)
+	case s.PeakStuck > 0:
+		l2 += fmt.Sprintf("; up to %d reads stuck at once", s.PeakStuck)
 	}
 	out = append(out, l2+".")
 	if s.BytesResumed > 0 {

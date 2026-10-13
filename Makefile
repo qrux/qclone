@@ -9,7 +9,8 @@
 #
 # Nothing here prints private paths: the tests and the demo use generated
 # files, and qclone itself never prints a file name to stdout (names go to
-# the terminal's /dev/tty only).
+# the terminal's /dev/tty only). Tests build with -trimpath, so a panic's
+# stack trace names source files by module path, not by where the clone is.
 
 SHELL := /bin/bash
 ROOT  := $(patsubst %/,%,$(dir $(abspath $(firstword $(MAKEFILE_LIST)))))
@@ -38,18 +39,18 @@ build:
 ## test: go vet, then every test with the race detector (includes copies against a simulated
 ##   degraded SSD; about 40 seconds)
 test:
-	@cd $(ROOT) && $(LOGGED) sh -c 'go vet ./... && go test -race -count=1 ./...'
+	@cd $(ROOT) && $(LOGGED) sh -c 'go vet ./... && go test -trimpath -race -count=1 ./...'
 
 ## demo: copy about 1 GB of generated files with --simulate degraded, so you can watch the
-##   display and the tuner at work on a pretend failing SSD (about a minute). The tuning
-##   display draws on the terminal; the log gets a status line every 10 s.
+##   display, the stuck reads and the tuner at work on a pretend failing SSD (about a
+##   minute). The display draws on the terminal; the log gets a status line every 10 s.
 demo:
 	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
 
-## demo-fixed: the same copy the way rclone copies: 4 files at once, one read each, in order,
-##   never tuned, to compare
+## demo-fixed: the same copy the way rclone copies, to compare: 4 reads of 1M in flight, in
+##   order, never tuned, and no room for stuck reads (they use up the 4)
 demo-fixed:
-	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --fixed --readers 4 --chunk 1M --files 4 --order dfs --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
+	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --fixed --readers 4 --chunk 1M --max-stuck 0 --order dfs --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
 
 ## demo-rescue: the copy from a simulated failing SSD that has some unreadable sectors: once
 ##   plain (unreadable spots mapped to 4 KiB, those files kept unfinished), then again with
@@ -82,8 +83,8 @@ brew-check:
 	@cd $(ROOT) && owner=$$(git remote get-url origin | sed -E 's#^git@[^:]+:([^/]+)/.*#\1#') && \
 	$(CLEANLOGGED) sh -c "brew tap $$owner/tap && brew audit --strict --online $$owner/tap/qclone && brew install --build-from-source $$owner/tap/qclone && brew test $$owner/tap/qclone && qclone --version"
 
-## tuner-diag: copy the demo tree through the simulated drive and print every tuner decision
-##   (hash and dfs order), then what pinned settings achieve; several minutes. For working on
-##   the tuner, not a test.
+## tuner-diag: copy the demo tree through the simulated drive in hash order, dfs order, and
+##   rclone's fixed shape; print each one's time, what was in flight, and every tuner
+##   decision; a few minutes. For working on the tuner, not a test.
 tuner-diag:
-	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && QCLONE_DIAG_SRC=$(DEMO)/src go test -count=1 -run "TestDiag" -v -timeout 30m ./internal/copier/'
+	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && QCLONE_DIAG_SRC=$$PWD/$(DEMO)/src go test -trimpath -count=1 -run "TestDiag" -v -timeout 30m ./internal/copier/'

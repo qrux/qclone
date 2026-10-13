@@ -161,8 +161,7 @@ func TestBisectionIsCheap(t *testing.T) {
 	reads := 0
 	fault := badDrive(ranges{{777 * 1024 &^ 4095, 4096}})
 	o := opts(filepath.Join(base, "e.txt"))
-	o.Start.Chunk = 1 << 20
-	o.Tuner.MinChunk, o.Tuner.MaxChunk = 1<<20, 1<<20
+	o.Chunk = 1 << 20
 	o.Rescue = true
 	runWith(t, []string{src + "/", filepath.Join(base, "d")}, o, func(s string, off int64, n int) error {
 		reads++

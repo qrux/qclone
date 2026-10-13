@@ -60,12 +60,11 @@ func fakeSnapshot(now time.Time) copier.Snapshot {
 			{Show: "photos/2011/IMG_4403.CR2", Size: 25e6, Age: 100 * time.Millisecond},
 		},
 		Tuner: tuner.Status{
-			Mode: "probing", Applied: tuner.Setting{Readers: 19, Chunk: 256 << 10},
-			Incumbent: tuner.Setting{Readers: 13, Chunk: 256 << 10}, Candidate: tuner.Setting{Readers: 19, Chunk: 256 << 10},
-			Arms:    []tuner.ArmRate{{Setting: tuner.Setting{Readers: 13}, Rate: 7.7e6, Final: true}, {Setting: tuner.Setting{Readers: 19}, Rate: 8.0e6, Final: true}, {Setting: tuner.Setting{Readers: 13}}, {Setting: tuner.Setting{Readers: 19}}, {Setting: tuner.Setting{Readers: 13}}},
-			Regimes: []tuner.RegimeView{{Rate: 7.8e6, Best: tuner.Setting{Readers: 13, Chunk: 256 << 10}, Current: true}, {Rate: 498e6, Best: tuner.Setting{Readers: 2, Chunk: 1 << 20}}},
-			Changes: 9,
+			Mode: "testing", Readers: 16, Base: 8, Candidate: 16, BaseRate: 412e6, Rate: 398e6,
+			History: []tuner.Decision{{At: 40 * time.Second, From: 4, To: 8, Gain: 0.38, Kept: true, Note: "kept"}},
+			Changes: 2,
 		},
+		Readers: 32, Reading: 31, Stuck: 16, PeakStuck: 20, MaxStuck: 16, Chunk: 256 << 10,
 		Devices: []copier.DeviceView{
 			{Role: "source", OK: true, Info: devInfo("disk4", "Samsung SSD 840 EVO 1TB", "USB", "Solid State"), Rates: rates(7.9e6, 0, 31, 412*time.Millisecond, 12.9)},
 			{Role: "dest", OK: true, Info: devInfo("disk0", "APPLE SSD AP8192Z", "Apple Fabric", "Solid State"), Rates: rates(0, 7.9e6, 31, 0, 0.3)},
@@ -142,9 +141,8 @@ func TestFramesDuringSimulatedCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := tuner.DefaultConfig()
 	errs := copier.NewErrorLog(filepath.Join(base, "e.txt"), nil, time.Now())
-	eng := copier.New(p, copier.Options{Start: tuner.Setting{Readers: 4, Chunk: 1 << 20}, Tuner: cfg, ModifyWindow: time.Second, Retries: 3, Errors: errs, Sim: sim.NewDevice(sim.Degraded())})
+	eng := copier.New(p, copier.Options{Readers: 4, Tuner: tuner.DefaultConfig(), MaxStuck: 16, Chunk: 1 << 20, ModifyWindow: time.Second, Retries: 3, Errors: errs, Sim: sim.NewDevice(sim.Degraded())})
 	hist := NewHistory(eng.Snapshot().Start)
 	done := make(chan struct{})
 	go func() { eng.Run(context.Background()); close(done) }()
@@ -164,7 +162,7 @@ func TestFramesDuringSimulatedCopy(t *testing.T) {
 		case <-tick.C:
 		}
 		s := eng.Snapshot()
-		hist.Record(s.Now, s.Rate, s.RateOK, s.Tuner.Applied.Readers)
+		hist.Record(s.Now, s.Rate, s.RateOK, s.Readers)
 		lines := Render(f, s, hist)
 		checkFrame(t, lines, f.W, f.H, fmt.Sprintf("frame %d", frames))
 		if s.BytesDone > 0 && !s.Done {

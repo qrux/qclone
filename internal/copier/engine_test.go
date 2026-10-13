@@ -53,8 +53,10 @@ func opts(errPath string) Options {
 	cfg := tuner.DefaultConfig()
 	cfg.MaxReaders = 8
 	return Options{
-		Start:        tuner.Setting{Readers: 4, Chunk: 256 << 10},
+		Readers:      4,
 		Tuner:        cfg,
+		MaxStuck:     16,
+		Chunk:        256 << 10,
 		ModifyWindow: time.Second,
 		Retries:      3,
 		Errors:       NewErrorLog(errPath, []string{"test"}, time.Now()),

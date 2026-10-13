@@ -1,290 +1,193 @@
 package tuner
 
 import (
-	"container/heap"
-	"math"
 	"math/rand"
 	"testing"
 	"time"
-
-	"qclone/internal/sim"
 )
 
-// vsim drives a Tuner against the simulated drive in virtual time: readers
-// issue chunk-sized reads one after another along a single stream, and the
-// region each read lands in depends on its position in that stream.
-type vsim struct {
-	t      *Tuner
-	model  sim.Model
-	region func(pos int64) sim.Region
-	rng    *rand.Rand
-	sigma  float64 // log-normal noise on each op's duration
-
-	now      time.Duration
-	pos      int64
-	inflight opHeap
-	ourBytes int64
-	setting  Setting
-
-	// per-second samples
-	secBytes []int64
-	secRead  []int
+// lane drives a Tuner in virtual time. The flying reads' throughput depends
+// only on the time and on how many flying reads there are.
+type lane struct {
+	t       *Tuner
+	rate    func(now time.Duration, w int) float64 // bytes/s
+	noise   float64                                // relative spread of each tick's bytes
+	starved func(now time.Duration) bool
+	rng     *rand.Rand
+	now     time.Duration
+	w       int
+	carry   float64
 }
 
-type vop struct {
-	start, end time.Duration
-	bytes      int64
+const (
+	tick  = 20 * time.Millisecond
+	chunk = 256 << 10
+)
+
+func newLane(start int, fixed bool, rate func(time.Duration, int) float64) *lane {
+	t := New(DefaultConfig(), start, fixed)
+	return &lane{t: t, rate: rate, rng: rand.New(rand.NewSource(1)), w: t.Readers()}
 }
 
-type opHeap []vop
-
-func (h opHeap) Len() int            { return len(h) }
-func (h opHeap) Less(i, j int) bool  { return h[i].end < h[j].end }
-func (h opHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *opHeap) Push(x interface{}) { *h = append(*h, x.(vop)) }
-func (h *opHeap) Pop() interface{} {
-	old := *h
-	x := old[len(old)-1]
-	*h = old[:len(old)-1]
-	return x
-}
-
-func newVsim(cfg Config, start Setting, region func(int64) sim.Region) *vsim {
-	return &vsim{t: New(cfg, start, false), region: region, rng: rand.New(rand.NewSource(1)), setting: start}
-}
-
-func (v *vsim) fill() {
-	for v.inflight.Len() < v.setting.Readers {
-		n := v.setting.Chunk
-		end := v.model.Schedule(v.now, v.region(v.pos), n)
-		if v.sigma > 0 {
-			f := math.Exp(v.rng.NormFloat64() * v.sigma)
-			end = v.now + time.Duration(float64(end-v.now)*f)
+func (l *lane) run(until time.Duration) {
+	for l.now < until {
+		l.now += tick
+		r := l.rate(l.now, l.w) * (1 + l.noise*l.rng.NormFloat64())
+		if r > 0 {
+			l.carry += r * tick.Seconds()
 		}
-		heap.Push(&v.inflight, vop{start: v.now, end: end, bytes: int64(n)})
-		v.pos += int64(n)
+		for l.carry >= chunk {
+			l.carry -= chunk
+			l.t.Record(Op{Start: l.now - tick/2, End: l.now, Bytes: chunk})
+		}
+		l.w = l.t.Step(Probe{Now: l.now, Starved: l.starved != nil && l.starved(l.now)})
 	}
 }
 
-func (v *vsim) oldest() time.Duration {
-	o := v.now
-	for _, op := range v.inflight {
-		if op.start < o {
-			o = op.start
+func (l *lane) history() []Decision { return l.t.Status(l.now).History }
+
+// scales: each flying read adds 20 MB/s, up to 16 of them.
+func scales(_ time.Duration, w int) float64 {
+	if w > 16 {
+		w = 16
+	}
+	return float64(w) * 20e6
+}
+
+func TestDoublesWhileItPays(t *testing.T) {
+	l := newLane(4, false, scales)
+	l.run(15 * time.Second)
+	if l.w != 16 {
+		t.Fatalf("flying reads %d, want 16; history %+v", l.w, l.history())
+	}
+	h := l.history()
+	want := []struct {
+		from, to int
+		kept     bool
+	}{{4, 8, true}, {8, 16, true}, {16, 32, false}}
+	if len(h) != len(want) {
+		t.Fatalf("history %+v", h)
+	}
+	for i, w := range want {
+		if h[i].From != w.from || h[i].To != w.to || h[i].Kept != w.kept {
+			t.Errorf("decision %d: %d -> %d kept %v, want %d -> %d kept %v", i, h[i].From, h[i].To, h[i].Kept, w.from, w.to, w.kept)
 		}
 	}
-	return o
+	if g := h[0].Gain; g < 0.9 || g > 1.1 {
+		t.Errorf("4 -> 8 measured %+.0f%%, want about +100%%", g*100)
+	}
 }
 
-func (v *vsim) run(until time.Duration) {
-	const tick = 100 * time.Millisecond
-	next := v.now
-	v.fill()
-	for v.now < until {
-		if v.inflight.Len() > 0 && v.inflight[0].end <= next {
-			op := heap.Pop(&v.inflight).(vop)
-			v.now = op.end
-			v.ourBytes += op.bytes
-			v.t.Record(Op{Start: op.start, End: op.end, Bytes: op.bytes})
-			sec := int(v.now / time.Second)
-			for len(v.secBytes) <= sec {
-				v.secBytes = append(v.secBytes, 0)
-				v.secRead = append(v.secRead, v.setting.Readers)
-			}
-			v.secBytes[sec] += op.bytes
-			v.fill()
-			continue
+func TestStaysWhenMoreDoesNotHelp(t *testing.T) {
+	l := newLane(4, false, func(time.Duration, int) float64 { return 400e6 })
+	l.run(10 * time.Second)
+	h := l.history()
+	if l.w != 4 || len(h) != 1 || h[0].To != 8 || h[0].Kept {
+		t.Fatalf("flying reads %d; history %+v", l.w, h)
+	}
+}
+
+// After the drive changes so that more than 8 flying reads hurt, the next
+// check tries up (worse), then down (better), and moves down.
+func TestRechecksBothWays(t *testing.T) {
+	l := newLane(4, false, func(now time.Duration, w int) float64 {
+		if now < 20*time.Second {
+			return scales(now, w)
 		}
-		v.now = next
-		next += tick
-		v.setting = v.t.Step(Probe{Now: v.now, OldestInflight: v.oldest(), DevReadBytes: -1, OurReadBytes: v.ourBytes})
-		v.fill()
-	}
-}
-
-// rate is mean bytes/s over [from, to) seconds.
-func (v *vsim) rate(from, to int) float64 {
-	var b int64
-	for s := from; s < to && s < len(v.secBytes); s++ {
-		b += v.secBytes[s]
-	}
-	return float64(b) / float64(to-from)
-}
-
-func (v *vsim) meanReaders(from, to int) float64 {
-	var n, c int
-	for s := from; s < to && s < len(v.secRead); s++ {
-		n += v.secRead[s]
-		c++
-	}
-	return float64(n) / float64(c)
-}
-
-func slowScalable() sim.Region {
-	return sim.Region{OpRate: 0.6e6, Bandwidth: 8e6, Overhead: 2 * time.Millisecond}
-}
-
-func fast() sim.Region {
-	return sim.Region{OpRate: 300e6, Bandwidth: 500e6, Overhead: 100 * time.Microsecond}
-}
-
-func start() Setting { return Setting{Readers: 4, Chunk: 1 << 20, Files: 1} }
-
-func TestClimbsWhenSlowRegionScales(t *testing.T) {
-	v := newVsim(DefaultConfig(), start(), func(int64) sim.Region { return slowScalable() })
-	v.run(900 * time.Second)
-	got := v.t.Setting()
-	r := v.rate(600, 900)
-	t.Logf("setting %+v, rate %.2f MB/s (bandwidth 8), at 4 readers it would be 2.4", got, r/1e6)
-	if got.Readers < 12 {
-		t.Errorf("readers = %d, want >= 12 (the drive saturates at about 14)", got.Readers)
-	}
-	if r < 0.85*8e6 {
-		t.Errorf("rate %.2f MB/s, want >= 6.8", r/1e6)
-	}
-}
-
-func TestStaysLowWhenSlowRegionDoesNotScale(t *testing.T) {
-	flat := sim.Region{OpRate: 2e6, Bandwidth: 2e6, Overhead: 2 * time.Millisecond}
-	v := newVsim(DefaultConfig(), start(), func(int64) sim.Region { return flat })
-	v.run(900 * time.Second)
-	got := v.t.Setting()
-	r := v.rate(300, 900)
-	t.Logf("setting %+v, rate %.2f MB/s", got, r/1e6)
-	if got.Readers > 4 {
-		t.Errorf("readers = %d, want <= 4: more reads in flight buy nothing here", got.Readers)
-	}
-	if r < 0.9*2e6 {
-		t.Errorf("rate %.2f MB/s, want >= 1.8", r/1e6)
-	}
-}
-
-func TestFastRegionKeepsFullSpeed(t *testing.T) {
-	v := newVsim(DefaultConfig(), start(), func(int64) sim.Region { return fast() })
-	v.run(120 * time.Second)
-	got := v.t.Setting()
-	r := v.rate(30, 120)
-	t.Logf("setting %+v, rate %.0f MB/s", got, r/1e6)
-	if r < 0.95*500e6 {
-		t.Errorf("rate %.0f MB/s, want >= 475", r/1e6)
-	}
-	if got.Readers < 2 {
-		t.Errorf("readers = %d: one read in flight can't saturate this drive", got.Readers)
-	}
-}
-
-// Q's drive: stretches of old data between stretches of fresh data. The
-// second visit to a slow stretch should start from what the first one learned.
-func TestRemembersSlowRegions(t *testing.T) {
-	const slowLen, fastLen = 1200e6, 15e9
-	period := int64(slowLen + fastLen)
-	v := newVsim(DefaultConfig(), start(), func(pos int64) sim.Region {
-		if pos%period < slowLen {
-			return slowScalable()
+		if w > 8 {
+			return 300e6 * 8 / float64(w)
 		}
-		return fast()
+		return 300e6
 	})
-	// Find when the stream enters the second slow stretch.
-	var secondSlow time.Duration = -1
-	for v.now < 1200*time.Second {
-		v.run(v.now + time.Second)
-		if secondSlow < 0 && v.pos > period && v.pos%period < slowLen {
-			secondSlow = v.now
+	l.run(15 * time.Second)
+	if l.w != 16 {
+		t.Fatalf("climbed to %d, want 16", l.w)
+	}
+	l.run(100 * time.Second)
+	if l.w != 8 {
+		t.Fatalf("flying reads %d, want 8; history %+v", l.w, l.history())
+	}
+	var down bool
+	for _, d := range l.history() {
+		if d.From == 16 && d.To == 8 && d.Kept {
+			down = true
 		}
-		if secondSlow >= 0 && v.now > secondSlow+60*time.Second {
-			break
+		if d.At > 20*time.Second && d.From == 8 && d.To == 16 && d.Kept {
+			t.Errorf("went back up: %+v", d)
 		}
 	}
-	if secondSlow < 0 {
-		t.Fatal("never reached the second slow stretch")
-	}
-	s := int(secondSlow / time.Second)
-	readers := v.meanReaders(s+15, s+60)
-	r := v.rate(s+15, s+60)
-	t.Logf("second slow stretch at %ds: mean readers %.1f, rate %.2f MB/s; regimes %+v", s, readers, r/1e6, v.t.Status(v.now).Regimes)
-	if readers < 10 {
-		t.Errorf("mean readers %.1f in the second slow stretch, want >= 10 (remembered)", readers)
-	}
-	if r < 0.75*8e6 {
-		t.Errorf("rate %.2f MB/s in the second slow stretch, want >= 6", r/1e6)
-	}
-}
-
-func TestChunkGrowsWhenReadsHaveOverhead(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.MaxReaders = 4
-	costly := sim.Region{OpRate: 300e6, Bandwidth: 2000e6, Overhead: 5 * time.Millisecond}
-	v := newVsim(cfg, start(), func(int64) sim.Region { return costly })
-	v.run(180 * time.Second)
-	got := v.t.Setting()
-	t.Logf("setting %+v, rate %.0f MB/s", got, v.rate(120, 180)/1e6)
-	if got.Chunk < 4<<20 {
-		t.Errorf("chunk = %d, want >= 4 MiB when each read costs 5 ms", got.Chunk)
-	}
-}
-
-func TestConvergesThroughNoise(t *testing.T) {
-	v := newVsim(DefaultConfig(), start(), func(int64) sim.Region { return slowScalable() })
-	v.sigma = 0.25
-	v.run(1500 * time.Second)
-	got := v.t.Setting()
-	r := v.rate(900, 1500)
-	t.Logf("setting %+v, rate %.2f MB/s", got, r/1e6)
-	if got.Readers < 9 {
-		t.Errorf("readers = %d under noise, want >= 9", got.Readers)
-	}
-	if r < 0.75*8e6 {
-		t.Errorf("rate %.2f MB/s under noise, want >= 6", r/1e6)
+	if !down {
+		t.Errorf("never moved 16 -> 8: %+v", l.history())
 	}
 }
 
 func TestFixedNeverMoves(t *testing.T) {
-	tu := New(DefaultConfig(), start(), true)
-	for i := 0; i < 1000; i++ {
-		now := time.Duration(i) * 100 * time.Millisecond
-		tu.Record(Op{Start: now, End: now + 50*time.Millisecond, Bytes: 1 << 20})
-		if s := tu.Step(Probe{Now: now, OldestInflight: now}); s != start() {
-			t.Fatalf("fixed tuner moved to %+v", s)
-		}
+	l := newLane(4, true, scales)
+	l.run(60 * time.Second)
+	if st := l.t.Status(l.now); l.w != 4 || st.Mode != "fixed" || len(st.History) != 0 {
+		t.Fatalf("flying reads %d, mode %q, history %+v", l.w, st.Mode, st.History)
 	}
 }
 
 func TestStarvedHolds(t *testing.T) {
-	tu := New(DefaultConfig(), start(), false)
-	for i := 0; i < 3000; i++ {
-		now := time.Duration(i) * 100 * time.Millisecond
-		tu.Record(Op{Start: now, End: now + 50*time.Millisecond, Bytes: 1 << 20})
-		if s := tu.Step(Probe{Now: now, OldestInflight: now, Starved: true}); s != start() {
-			t.Fatalf("starved tuner moved to %+v", s)
-		}
+	l := newLane(4, false, scales)
+	l.starved = func(time.Duration) bool { return true }
+	l.run(60 * time.Second)
+	if st := l.t.Status(l.now); l.w != 4 || st.Mode != "waiting for work" || len(st.History) != 0 {
+		t.Fatalf("flying reads %d, mode %q, history %+v", l.w, st.Mode, st.History)
 	}
 }
 
-func TestFluidWindow(t *testing.T) {
-	w := &window{t0: 10 * time.Second, t1: 12 * time.Second}
-	w.add(Op{Start: 9 * time.Second, End: 11 * time.Second, Bytes: 100})  // half inside
-	w.add(Op{Start: 11 * time.Second, End: 15 * time.Second, Bytes: 400}) // a quarter inside
-	w.add(Op{Start: 5 * time.Second, End: 9 * time.Second, Bytes: 999})   // outside
-	if w.bytes != 150 {
-		t.Fatalf("fluid bytes = %v, want 150", w.bytes)
+// Starved in the middle of a test: the test is off and the number goes back.
+func TestStarvedMidTestGoesBack(t *testing.T) {
+	l := newLane(4, false, scales)
+	l.starved = func(now time.Duration) bool { return now > 2*time.Second && now < 3*time.Second }
+	l.run(2500 * time.Millisecond)
+	if l.w != 4 {
+		t.Fatalf("flying reads %d during starvation, want 4 back", l.w)
 	}
-	if r := w.rate(); r != 75 {
-		t.Fatalf("rate = %v, want 75", r)
+	if h := l.history(); len(h) != 1 || h[0].Note != "starved" {
+		t.Fatalf("history %+v", h)
+	}
+	l.run(30 * time.Second)
+	if l.w != 16 {
+		t.Fatalf("flying reads %d after starvation, want 16", l.w)
 	}
 }
 
-func TestNoisyWindow(t *testing.T) {
-	w := &window{t0: 0, t1: time.Second, dev0: 0, dev1: 50e6, our0: 0, our1: 10e6}
-	if !w.noisy() {
-		t.Fatal("device read 5x what we did; should be noisy")
+// Nothing flying (every read stuck): nothing to judge by, so it holds.
+func TestTooFewFlyingReads(t *testing.T) {
+	l := newLane(4, false, func(time.Duration, int) float64 { return 0 })
+	l.run(20 * time.Second)
+	h := l.history()
+	if l.w != 4 || len(h) == 0 || h[0].Note != "too few flying reads" || h[0].From != 4 || h[0].To != 8 {
+		t.Fatalf("flying reads %d; history %+v", l.w, h)
 	}
-	w.dev1 = 11e6
-	if w.noisy() {
-		t.Fatal("device read about what we did; should not be noisy")
+}
+
+// Ordinary jitter in the flying reads doesn't make it wander.
+func TestSteadyUnderJitter(t *testing.T) {
+	l := newLane(4, false, func(time.Duration, int) float64 { return 400e6 })
+	l.noise = 0.1
+	l.run(180 * time.Second)
+	if st := l.t.Status(l.now); st.Changes > 1 {
+		t.Fatalf("%d changes on a flat drive; history %+v", st.Changes, st.History)
 	}
-	w.dev0 = -1
-	w.dev1 = 1e12
-	if w.noisy() {
-		t.Fatal("unknown device counters must not count as noisy")
+}
+
+// Ops that began before a change don't count toward the measurement after it.
+func TestOldOpsDoNotCount(t *testing.T) {
+	tu := New(DefaultConfig(), 4, false)
+	tu.Step(Probe{Now: 2 * time.Second}) // past warmup: measuring 4
+	tu.mu.Lock()
+	tu.from = 2 * time.Second
+	tu.since = 2 * time.Second
+	tu.mu.Unlock()
+	tu.Record(Op{Start: time.Second, End: 2100 * time.Millisecond, Bytes: 1 << 30})
+	tu.Record(Op{Start: 2050 * time.Millisecond, End: 2100 * time.Millisecond, Bytes: 100})
+	tu.mu.Lock()
+	defer tu.mu.Unlock()
+	if tu.bytes != 100 || tu.ops != 1 {
+		t.Fatalf("counted %d bytes in %d ops; only the op begun after the window's start counts", tu.bytes, tu.ops)
 	}
 }

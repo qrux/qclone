@@ -86,49 +86,58 @@ Reads and writes also bypass the macOS file cache (`F_NOCACHE`, `--cached` to
 turn that off). That way the rate shown is the disk's own, not a burst into
 memory followed by a stall while it flushes.
 
-## It tunes itself
+## Stuck reads don't hold up the rest
 
-qclone controls two things: how many reads are in flight (readers) and how big
-each one is (chunk). Every file is cut into chunks in order, and the readers take
-chunks from wherever the queue is. So a big file is read by several readers at
-once, and small files are copied side by side, both under the same setting.
+Every file is cut into chunks (256 KiB; `--chunk` changes it), and a pool of
+readers takes chunks as they come free. So a big file is read by several
+readers at once, and small files are copied side by side.
 
-The tuner sets both by experiment. The difficulty is that the drive's own speed
-swings 250x between regions, which drowns out the effect of any one setting.
-So the tuner never compares a setting with the past. Each round runs five short
-arms in the order A C A C A, where A is the current setting and C is a
-candidate. Each C is scored against the mean of the A arms on either side,
-which cancels any steady drift in the drive's speed. A round whose A arms
-disagree badly (the copy moved to a different region mid-test) doesn't count.
-When A C A alone already shows a 25% difference, the round ends early. A
-verdict is also thrown out if it claims more than the change could cause.
-Twice the readers can at most double throughput, so a bigger jump means the
-candidate's arm fell into a faster or slower region than the arms around it.
+A read that has been in flight longer than 50 ms is **stuck**. A healthy SSD
+reads a chunk in about a millisecond; old data on a degraded one takes hundreds
+of milliseconds, or seconds. Every other read is **flying**. qclone keeps
 
-- More readers must buy at least 5% to be kept. Fewer readers are kept if they
-  cost no more than 2%: fewer reads in flight is easier on a struggling drive.
-  At the start, and after moving into a slower region, the reader count
-  doubles each step until a step stops paying, then refines.
-- A bigger chunk must buy 3%. A smaller one is kept if it costs no more than 2%.
-  The chunk only grows while reads finish in under half a second, because
-  bigger reads in a slow region make every reaction slower.
-- Throughput in each arm is measured "fluidly": each read+write is spread over
-  its own start-to-end interval, and an arm counts only the part inside it.
-  Measuring starts two read-generations after a change. With only one, reads
-  issued during the switch sit behind a queue that is still growing, and any
-  deeper queue looks 15-20% better than it is.
-- It remembers regions by speed, and the best setting found in each. On
-  re-entering a slow region it jumps straight to what worked there before.
-- It reads the source disk's counters straight from IOKit (the same numbers
-  `iostat` prints, without spawning it). If the disk read much more than qclone
-  did during an arm, something else was using it, and the arm doesn't count.
+```
+reads in flight = flying + min(stuck, 16)
+```
 
-Whether more reads in flight help a degraded drive depends on its controller.
-If error correction runs on each flash die separately, more reads in flight
-overlap it and the slow regions speed up. If the controller handles error
-recovery one read at a time, nothing helps, and the tuner settles at a low
-count. The same happens behind a USB bridge that doesn't queue commands. Either
-way it is measured, not assumed.
+so stuck reads never use up the flying ones' room, and once 16 are stuck
+(`--max-stuck`), nothing more is opened for them. A reader that comes free
+goes, in this order:
+
+1. While fewer than 16 reads are stuck, to a slow file's next chunk. A file is
+   slow while it has a stuck read, or if its last read was slow. Reads sent to
+   a slow file count as stuck from the start, so slow files carry on in the
+   stuck reads' room and take nothing from the flying ones.
+2. Otherwise, to a file with nothing stuck. A file none of whose reads has
+   finished yet gets one read at a time, so finding out that a new file is
+   slow costs one read, not all of them. When no open file has a chunk to
+   give, the next file is opened.
+3. Otherwise, to a slow file, so no reader sits idle while there's work. When
+   everything is slow, that makes flying + 16 reads in flight, all of them
+   stuck.
+
+Files go in hash order by default: of the next 1,024 files the walk has found,
+the one whose path hashes lowest goes next. Data written together usually sits
+together in folders, so this mixes old and new data, and there's usually fresh
+work for the flying reads while slow files grind. `--order dfs` copies depth
+first with names sorted; `--order dirent` copies depth first as the disk lists
+them.
+
+The number of flying reads tunes itself. It starts at 4 (`--readers`) and
+doubles while each doubling makes the flying reads at least 5% faster; when one
+doesn't, it goes back. Every 30 seconds it tries one step up and one step down,
+each against a fresh measurement of the current number, and moves only to one
+that is at least 5% faster. A measurement lasts at least a second and 20
+flying reads. Only flying reads are measured. They all read fresh data at
+about the same speed, so a plain before-and-after comparison holds. Throughput
+counting every read would mostly measure which slow files happened to be open.
+
+Whether more reads in flight speed up a degraded drive's slow regions depends
+on its controller. If error correction runs on each flash die separately, more
+reads overlap it, and the room for 16 stuck reads pays off. If the controller
+recovers one read at a time, they gain nothing, and fast reads wait behind them
+inside the drive (and then count as stuck too). A USB bridge that doesn't queue
+commands allows one read at a time, whatever qclone asks for.
 
 ## The display
 
@@ -136,9 +145,9 @@ A full-screen ASCII display, redrawn four times a second:
 
 - an overall progress bar, counts and ETA
 - a log-scale speed chart (2 MB/s and 500 MB/s on one chart), colored by how
-  slow each moment was, with the reader count charted beneath it
-- the tuner: the setting now, the arms of the test in progress, its last
-  verdict, and the regions it has learned
+  slow each moment was, with the reads in flight charted beneath it
+- the reads in flight, flying and stuck, and the tuner's test in progress or
+  its last verdict
 - the source and destination disks (model, interface, rates, time per read,
   queue depth, the disk's own error and retry counters)
 - one progress bar per file in flight
@@ -151,10 +160,14 @@ and paths are never written to stdout, so a log of a run holds none.
 ## Flags
 
 ```
--j, --readers N      reads in flight at the start (default 4)
-    --max-readers N  most reads in flight the tuner may use (default 32)
-    --chunk SIZE     bytes per read, e.g. 256K, 4M; fixes it (default: tuned, from 256K)
-    --fixed          don't tune: keep --readers and --chunk as given
+-j, --readers N      flying reads at the start (default 4); doubled while that
+                     makes them faster
+    --max-readers N  most flying reads (default 32)
+    --max-stuck N    room for reads stuck over 50 ms, beside the flying ones
+                     (default 16); 0: stuck reads use up flying ones
+    --chunk SIZE     bytes per read, e.g. 256K, 4M (default 256K)
+    --order ORDER    hash (default), dfs or dirent: the order files go in
+    --fixed          don't tune: keep --readers as given
     --errors FILE    where errors go (default: <timestamp>-qclone-errors.txt here)
     --rescue         install files with unreadable spots, zeros there (listed in the
                      error file; a later run tries those spots again)
@@ -186,7 +199,7 @@ build). Releases are published with `make release VERSION=x.y.z`; see
 make build       # build/qclone
 make test        # vet and all tests, with the race detector
 make demo        # ~1 GB copy on a simulated degraded SSD, to watch the tuner work
-make demo-fixed  # the same copy at a fixed 4 readers x 1M, for comparison
+make demo-fixed  # the same copy the way rclone does it: 4 reads x 1M, no room for stuck ones
 make demo-rescue # a failing drive: a plain pass, then a --rescue pass
 make install     # copy qclone to ~/bin
 make release VERSION=x.y.z   # tag, and publish the formula to the Homebrew tap
