@@ -1,0 +1,39 @@
+qclone 0.1.0's full-screen display, 40 s into `make demo` (the simulated degraded SSD),
+captured at 120x48 without color, before the rename (the title now says qclone, as here).
+The header's paths are replaced with neutral ones. The current main also shows files at once in the TUNER line.
+
+ qclone    ~/demo/src/ -> ~/demo/dst                                                                     elapsed 0:00:40
+========================================================================================================================
+ TOTAL  [##############################################################>..........................]   70.2%  ETA 0:00:17
+        683 MB of 972 MB   361 of 362 files
+
+ SPEED  24.4 MB/s now   17.0 MB/s avg   57.5 MB/s peak                                log scale, last 40s, 1s per column
+   70M |                                                                                            :::                
+   50M |                                                                                           .###.               
+   30M |                                                                                       #########             ::
+   20M |                                                                                       #########....     ....##
+   15M |                                                                                       #############    :######
+   10M |                                                                                     ..#############::::#######
+    7M |                                                                                .##############################
+    5M |                                                                           ...::###############################
+    3M |                                                                       ..:#####################################
+    2M |                                                                      :########################################
+  1.5M |                                                                      #########################################
+    1M +----------------------------------------------------------------------------------------------------- readers -
+    32 |                                                                                     ###  #######..#####..#####
+       |                                                                               ::  ::###::#####################
+     1 |                                                                      :::###:##################################
+
+ TUNER  32 readers x 256K   holding
+        last: not enough queued work to test, 1s ago                                                           3 changes
+
+ SOURCE sim0  simulated degraded SSD, simulated, SSD
+        read 8.34 MB/s, 32 ops/s  634 ms each  queue 20.2  errors 0  retries 0
+ DEST   disk0  APPLE SSD AP8192Z, Apple Fabric, SSD
+        write 11.5 MB/s, 394 ops/s  queue 0.0  errors 0  retries 0
+
+ FILES  32 readers on 1 file
+  [#####>..............]  28.1%    24.4 MB/s     114 MB of 403 MB     video/clip-2.mov
+
+ ERRORS none
+ Ctrl-C stops cleanly (reads in flight finish, partial files are removed); twice quits now

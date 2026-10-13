@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qclone v2 as built</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#5f6368; --bg:#ffffff; --code:#f4f4f6; --rule:#d9d9de; --accent:#0a5bd3; --warn:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e8ea; --muted:#a1a1a8; --bg:#161618; --code:#232327; --rule:#38383d; --accent:#6aa5ff; --warn:#ff8a80; } }
+  body { font: 16px/1.55 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg); max-width: 50rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.8rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.3rem; margin-top: 2.2rem; border-bottom: 1px solid var(--rule); padding-bottom: .2rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.4rem; }
+  .meta { color: var(--muted); margin-top: 0; }
+  code, pre { font: 14px/1.45 ui-monospace, Menlo, monospace; background: var(--code); border-radius: 4px; }
+  code { padding: 0 .25em; }
+  pre { padding: .7rem .9rem; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: 15px; }
+  th, td { border: 1px solid var(--rule); padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  th { background: var(--code); }
+  .note { border-left: 3px solid var(--accent); padding: .2rem .8rem; color: var(--muted); }
+  .warn { border-left: 3px solid var(--warn); padding: .2rem .8rem; }
+</style>
+</head>
+<body>
+
+<h1>qclone v2, as built</h1>
+<p class="meta">2026-10-13 &middot; repo <code>~/proj/qrux/qclone</code> (github.com/qrux/qclone) &middot; describes <code>main</code> at
+<code>31beeef</code>, not yet released (the Homebrew tap still serves 0.1.0) &middot; written by the Claude Code session that built it</p>
+
+<p class="note">This covers what changed after <a href="qclone-v1-built.html">qclone-v1-built.html</a> (0.1.0, commit
+<code>0f0321b</code>, documented at <code>1e1da38</code>). Everything in v1 still holds unless this document says otherwise. As in v1,
+there was no spec: the work followed Q's requests in chat on 2026-10-13.</p>
+
+<div class="warn"><p><b>Read first:</b> the new default, <code>--order hash</code>, works and copies correctly, but the tuner
+mostly fails to tune under it. On the simulated drive the demo took 141&nbsp;s in hash order against 54&nbsp;s in dfs order
+(section 6.1). A fix is proposed and awaits Q's decision. Until then, <code>--order dfs</code> tunes as well as 0.1.0 did.</p></div>
+
+<h2>1. What was asked</h2>
+<ul>
+  <li>While running qclone, Q saw "16 readers on 1 file" and asked why not one reader on each of 16 files.</li>
+  <li>Q proposed ordering files by a hash of the path, to spread the reads around the drive, and agreed to keep several
+      files in flight at once with readers taking chunks from them in turn.</li>
+  <li>Hash order within a window of 1,024 files (or another fast power of two), so copying can start before the walk
+      ends.</li>
+  <li>A switch for DFS order, dirent order or hash order, with hash as the default. Scrambled finishing order and a few
+      more partial files on a stopped run are acceptable.</li>
+  <li>The speed chart's scale must never shrink once it has grown; the rescaling "vibration" was the complaint.</li>
+</ul>
+
+<h2>2. What was built</h2>
+<table>
+  <tr><th>Piece</th><th>Where</th><th>What it does</th></tr>
+  <tr><td>Files in flight</td><td><code>internal/copier/engine.go</code> (<code>dispatch</code>, <code>openFile</code>, <code>startFile</code>, <code>finished</code>)</td>
+      <td>The dispatcher keeps the tuner's number of files open and hands out their chunks in turn. Each open file
+      may have at most readers &divide; files chunks in flight, rounded up; when only one file is open, it may have all the
+      readers.</td></tr>
+  <tr><td>A third tuned setting</td><td><code>internal/tuner/tuner.go</code> (<code>Setting.Files</code>, <code>DimFiles</code>)</td>
+      <td>Files at once, tuned with the same A C A C A rounds as readers and chunk size. The range is 1 to
+      <code>--max-readers</code>, and it starts at 4 (<code>--files N</code>).</td></tr>
+  <tr><td>Hash-order queue</td><td><code>internal/copier/util.go</code> (<code>fileQueue</code>, <code>fileHeap</code>)</td>
+      <td>From the next 1,024 files the walk has found, the one whose path hashes lowest goes next. While the walk is still
+      finding files, it waits for a full window, but never more than 0.5&nbsp;s after the last file arrived.</td></tr>
+  <tr><td>Walk orders</td><td><code>internal/plan/plan.go</code> (<code>Order</code>, <code>ParseOrder</code>, <code>walkFrom</code>)</td>
+      <td>A new walker replaces <code>filepath.WalkDir</code>, which always sorts. It sorts names for <code>dfs</code> and
+      <code>hash</code>, and for <code>dirent</code> keeps the order the file system lists them.</td></tr>
+  <tr><td>Flags</td><td><code>cmd/qclone/main.go</code></td>
+      <td><code>--order hash|dfs|dirent</code> (default <code>hash</code>); <code>--files N</code> (default 4, capped at
+      <code>--max-readers</code>; fixed by <code>--fixed</code>).</td></tr>
+  <tr><td>Chart scale</td><td><code>internal/ui/render.go</code>, <code>history.go</code></td>
+      <td>The speed chart's range, and the top of the readers strip, only ever widen.</td></tr>
+  <tr><td>Tuner under noise</td><td><code>internal/tuner/tuner.go</code></td>
+      <td>Arms lengthen while rounds are noisy, there are no early verdicts until a round has measured quiet, and region
+      memory jumps only to settings a test kept (section 3.3).</td></tr>
+  <tr><td>Display text</td><td><code>internal/ui/render.go</code></td>
+      <td>The setting now reads "16 readers x 256K, 4 files". Tests of files at once read "more files at once 4 -&gt; 8".</td></tr>
+  <tr><td>Diagnostics</td><td><code>internal/copier/diag_test.go</code>, <code>make tuner-diag</code></td>
+      <td>Copies the demo tree through the simulated drive and prints every tuner decision, in hash and dfs order, then
+      what pinned settings achieve. Skipped by <code>make test</code>.</td></tr>
+  <tr><td><code>make demo-fixed</code></td><td><code>Makefile</code></td>
+      <td>Now copies the way rclone does: 4 files at once with one read each, in order, never tuned
+      (<code>--readers 4 --chunk 1M --files 4 --order dfs --fixed</code>).</td></tr>
+</table>
+
+<h2>3. Choices made, and why</h2>
+
+<h3>3.1 Files in flight</h3>
+<ul>
+  <li><b>A cap per file.</b> If readers simply took chunks from the open files in turn, they would drift into whichever
+      file is slow. A fast chunk frees its reader in milliseconds and a slow one holds it for seconds, so before long
+      nearly every reader waits on the slow file. The cap, readers &divide; files, lets a slow file tie up only its share.</li>
+  <li><b>The cap lifts for the last file.</b> It's computed from how many files are actually open, so when only one is
+      left, it gets every reader. Without that, the end of every run would crawl.</li>
+  <li><b>Default 4, range 1 to <code>--max-readers</code>, in doubling steps.</b> More files than reads in flight would
+      leave some files idle. Moving up must gain 3%; moving down may cost up to 2%, since fewer files at once means fewer
+      partial files on a stopped run.</li>
+  <li><b>No plausibility bound for files.</b> Readers and chunk size can at most double throughput when doubled. A second
+      file in flight can be a fast one beside a slow one and gain far more, so that check would wrongly void real gains.</li>
+  <li><b>With <code>--files 1</code>, behavior is exactly 0.1.0's</b> (one file at a time, all readers on it).</li>
+</ul>
+
+<h3>3.2 Order</h3>
+<ul>
+  <li><b>What hash order spreads is data age, not location.</b> On an SSD, a path says nothing about where data
+      physically sits; the controller spreads everything across its flash anyway. Slowness comes from the age of the
+      data, and files in one folder were usually written together. Alphabetical order keeps the readers inside one age
+      group; hash order mixes old and new data.</li>
+  <li><b>Key:</b> FNV-64a of the path as displayed (relative to the destination), so the order is the same on every run,
+      which suits resuming.</li>
+  <li><b>Window of 1,024 files, and 0.5&nbsp;s patience.</b> Q's number. Copying starts once the window fills, or once the
+      walk has found nothing new for half a second, so a slow walk on a degraded drive never stalls the copy.</li>
+  <li><b><code>dfs</code></b> is the old order: depth first, names sorted.</li>
+  <li><b><code>dirent</code></b> is depth first in the file system's own listing order. On APFS that order is already a hash
+      of the names within each folder; on exFAT it's roughly creation order.</li>
+</ul>
+
+<h3>3.3 Tuner changes for mixed workloads</h3>
+<ul>
+  <li><b>Arms stretch.</b> After a full round whose A arms are more than 10% off a straight line, arm length doubles, up to
+      16&times;. After a round within 3%, it shrinks by a quarter, back toward 1&times;. Only arms stretch; the checks for a
+      change of region between tests keep the base length, so the tuner still notices a new region quickly.</li>
+  <li><b>Early verdicts</b> (deciding after A C A) now need a previous full round that measured quiet, an unstretched arm
+      length, and the two A arms within 10% (was 20%).</li>
+  <li><b>Region memory</b> jumps only to a setting that a test in that region actually kept. Before this, it could jump
+      to a starting value that had merely never been beaten.</li>
+  <li>An earlier attempt also stretched arms after every "region changed" verdict. That broke region memory on clean
+      drives, where those verdicts are genuine region switches, so it was removed. The simulation test that caught it is
+      <code>TestRemembersSlowRegions</code>.</li>
+</ul>
+
+<h3>3.4 Chart scale</h3>
+<ul>
+  <li>The vertical range is the widest seen in the run, kept in the display's history, so it no longer jumps as a column
+      in progress changes, or as wider time columns average the extremes away. The readers strip's top works the same way.
+      An early dip widens the range for the rest of the run, which is the intended trade.</li>
+</ul>
+
+<h2>4. Where the build departs from the request</h2>
+<ul>
+  <li><b>Default order:</b> hash, as asked, although the tuner can't yet tune well under it (6.1).</li>
+  <li><b>Per-file cap:</b> not part of the request. It's needed so that several files at once actually spreads the readers
+      instead of piling them onto the slow file.</li>
+</ul>
+
+<h2>5. What was verified, and how</h2>
+<ul>
+  <li><b><code>make test</code>:</b> 54 tests pass with the race detector, and 2 diagnostics are skipped by design. New since
+      v1:
+    <ul>
+      <li><code>TestSlowFileDoesNotHoldEveryReader</code>: one slow file, whose reads the drive serves one at a time, ahead
+          of 64 fast chunks. With 1 file at once, 0 fast chunks moved during the slow file's first half; with 4, all 64
+          did.</li>
+      <li><code>TestOrders</code>: <code>dfs</code> is sorted, <code>hash</code> matches the FNV order of the paths, and
+          <code>dirent</code> copies everything.</li>
+      <li><code>TestWalkOrders</code>: the walker's sorted and unsorted modes, and <code>--order</code> parsing.</li>
+      <li><code>TestChartScaleOnlyWidens</code>: the axis stays put through a run whose early extremes get averaged away.
+          It also checks that, without that history, the axis would have changed.</li>
+    </ul>
+  </li>
+  <li><b>Byte-identical copies</b> of the ~1&nbsp;GB demo tree in hash order (<code>diff -r</code>), with nothing on
+      stderr.</li>
+  <li><b>Demo timings</b> on the simulated degraded drive, tuned, starting at 4 readers &times; 256K, 4 files:
+      <b>hash order 141&nbsp;s, dfs order 54&nbsp;s</b>. For comparison, 0.1.0 took 52&nbsp;s (dfs, 1 file at a time).</li>
+  <li><b>Pinned settings,</b> MB/s over the first 20&nbsp;s (<code>TestDiagPinnedSettings</code>):
+    <table>
+      <tr><th>Order</th><th>Files at once</th><th>4 readers</th><th>8 readers</th><th>16 readers</th></tr>
+      <tr><td>hash</td><td>1</td><td>6.33</td><td>10.37</td><td>22.57</td></tr>
+      <tr><td>hash</td><td>4</td><td>4.22</td><td>7.56</td><td>15.17</td></tr>
+      <tr><td>dfs</td><td>1</td><td>2.40</td><td>8.65</td><td>21.88</td></tr>
+      <tr><td>dfs</td><td>4</td><td>2.41</td><td>8.62</td><td>17.06</td></tr>
+    </table>
+    In hash order, 8 readers are 79% faster than 4. The tuner measured that same change as &minus;10% and rejected it.
+  </li>
+</ul>
+
+<h2>6. Concerns and open issues</h2>
+
+<h3>6.1 The tuner can't see through a shuffled mix (the main issue)</h3>
+<p>In hash order, the open files are a random mix of slow and fast ones. An arm lasts a second or two, so its bytes per
+second mostly reflect which files happened to be open, not the setting under test, and the swings are far larger than
+the effects being measured. Longer arms help only a little: most rounds still come out too noisy to decide, so tuning
+barely moves. The pinned measurements show hash order itself isn't slower (at 16 readers and 1 file it matched dfs).
+The weakness is in the measurement.</p>
+<p><b>Proposed fix, awaiting Q:</b> compare each file against itself. For each file that spans several arms (most bytes
+are in such files), take its own rate under the candidate setting against its rate in the A arms on either side.
+Combine those per-file ratios weighted by bytes, falling back to overall throughput when too few bytes are shared
+between arms. A file's region speed then cancels out, because it's the same file in both arms. The measure of done:
+<code>make tuner-diag</code> shows hash order tuning about as well as dfs.</p>
+
+<h3>6.2 Several files at once is slower in the simulator</h3>
+<p>Pinned, 4 files at once is slower than 1 in this simulator: about 30% in hash order at every reader count, and in
+dfs order even at 4 and 8 readers but 22% slower at 16. The simulated drive has one
+shared bandwidth limit for every read, the case where the drive's error correction is a single shared resource, so
+spreading can't gain anything, while the cap gives the slow files fewer readers. A real drive whose slowness is confined
+to the flash dies holding old data could behave the other way. Measuring that is the tuner's job, which depends on 6.1.
+A simulator variant with separate slow and fast resources would let the tests show the case where spreading wins; it
+hasn't been built.</p>
+
+<h3>6.3 Defaults to revisit once 6.1 is settled</h3>
+<ul>
+  <li><code>--order hash</code> as the default (Q's choice), versus <code>dfs</code> until the tuner copes.</li>
+  <li><code>--files 4</code> as the starting value, versus 1 (0.1.0's behavior).</li>
+</ul>
+
+<h3>6.4 Not yet done</h3>
+<ul>
+  <li><b>README</b> doesn't mention <code>--order</code>, <code>--files</code>, several files at once, or the chart scale
+      that only widens.</li>
+  <li><b>No 0.2.0 release.</b> <code>make release VERSION=0.2.0</code> would publish it; it should wait for 6.1.</li>
+  <li><b><code>main</code> is one commit ahead of GitHub</b> (<code>31beeef</code>, plus this document).</li>
+  <li>A <code>Status</code> now carries up to 64 tuner decisions (was 8) so the diagnostics can print them all. The
+      display still shows only the last.</li>
+</ul>
+
+<h3>6.5 Carried over from v1, still open</h3>
+<ul>
+  <li><b>No run on the real degraded drive yet.</b> Q started one. Its first observation, "16 readers on 1 file", led to
+      this revision; no results have come back.</li>
+  <li><b>Not copied:</b> extended attributes, ACLs, resource forks, Finder tags, hard links. No cloud remotes.</li>
+  <li><b>Copyright</b> in AI-written code is uncertain, and every commit carries a Claude co-author line.</li>
+</ul>
+
+<h3>6.6 Environment, found during this work (not qclone's code)</h3>
+<ul>
+  <li><b><code>~/.claude/settings.json</code> doesn't parse</b> (a missing comma after its
+      <code>Edit(~/.claude/settings.local.json)</code> deny rule), so Claude Code ignores the whole file. None of its deny
+      rules are in effect, including the ones that bar reads and writes under <code>/Volumes</code>. Sessions working on
+      qclone, a tool meant for external drives, should stay off <code>/Volumes</code> by their own discipline until Q
+      fixes the comma.</li>
+  <li><b><code>~/jorp/Makefile</code>'s <code>proj-</code> target</b> looked for repos outside the monoproj, and appended
+      one <code>.gitignore</code> line per link. Both were fixed on 2026-10-13, with Q's explicit OK for those two edits.</li>
+</ul>
+
+<h2>7. Assets</h2>
+<ul>
+  <li><code>docs/assets/display-sample-0.1.0.txt</code>: the full-screen display 40&nbsp;s into <code>make demo</code>, from
+      0.1.0, without color, with neutral paths. The current display also shows files at once on the TUNER line.</li>
+  <li><code>docs/built/qclone-v1-built.html</code>: the previous revision's as-built.</li>
+</ul>
+
+</body>
+</html>
