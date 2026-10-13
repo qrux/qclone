@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qclone v3 as built</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#5f6368; --bg:#ffffff; --code:#f4f4f6; --rule:#d9d9de; --accent:#0a5bd3; --warn:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e8ea; --muted:#a1a1a8; --bg:#161618; --code:#232327; --rule:#38383d; --accent:#6aa5ff; --warn:#ff8a80; } }
+  body { font: 16px/1.55 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg); max-width: 50rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.8rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.3rem; margin-top: 2.2rem; border-bottom: 1px solid var(--rule); padding-bottom: .2rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.4rem; }
+  .meta { color: var(--muted); margin-top: 0; }
+  code, pre { font: 14px/1.45 ui-monospace, Menlo, monospace; background: var(--code); border-radius: 4px; }
+  code { padding: 0 .25em; }
+  pre { padding: .7rem .9rem; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: 15px; }
+  th, td { border: 1px solid var(--rule); padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  th { background: var(--code); }
+  .note { border-left: 3px solid var(--accent); padding: .2rem .8rem; color: var(--muted); }
+  .warn { border-left: 3px solid var(--warn); padding: .2rem .8rem; }
+</style>
+</head>
+<body>
+
+<h1>qclone v3, as built</h1>
+<p class="meta">2026-10-13 &middot; repo <code>~/proj/qrux/qclone</code> (github.com/qrux/qclone) &middot; not yet released (the
+Homebrew tap still serves 0.1.0) &middot; written by the Claude Code session that built it</p>
+
+<p class="note">This covers what changed after <a href="qclone-v2-built.html">qclone-v2-built.html</a> (main at <code>31beeef</code>,
+documented at <code>0d19ca2</code>). Everything in v1 and v2 still holds unless this document says otherwise. As before, there was
+no spec: the work followed Q's requests in chat on 2026-10-13.</p>
+
+<div class="note"><p><b>In one line:</b> the A C A C A tuner is gone. qclone now keeps
+<code>reads in flight = flying + min(stuck, 16)</code>, where a read is stuck after 50&nbsp;ms in flight, and tunes only the
+flying number, judged on reads that never got stuck. On the simulated drive the demo copy takes 46&nbsp;s in hash order
+(v2: 141&nbsp;s; 0.1.0: 52&nbsp;s in dfs order).</p></div>
+
+<h2>1. What was asked</h2>
+<ul>
+  <li>Q asked why the v2 tuner measured 4&nbsp;&rarr;&nbsp;8 readers as &minus;10% in hash order when pinned runs showed
+      +79% (section 6 has the answer).</li>
+  <li>Then Q asked for the simplest approach that works: "Don't use up too many channels. Don't go past 16 readers if
+      they're all blocked and slow. Use more if another is fast or finishes-fast."</li>
+  <li>Q's clarification: "It's not hard-16. It's just saying that if 16 are stuck, then don't open more. If everything
+      is flying, the tune automatically, and open as many as throughput increases."</li>
+  <li>Agreed design: <code>reads in flight = W + min(stuck, 16)</code>. A read is stuck after 50&nbsp;ms in flight. W
+      (flying reads) starts at 4, doubles while each doubling makes it at least 5% faster, goes back when one doesn't,
+      and every 30&nbsp;s tries one step up and one down. New reads go to files with nothing stuck; slow files keep going
+      in the stuck reads' room. Delete the tuner, files at once, the per-file cap and chunk tuning; chunks fixed at
+      256&nbsp;KiB; the 16 becomes a flag. Done when <code>make test</code> passes, demo copies are byte-identical, and
+      hash order on the simulated drive is about as fast as 0.1.0's 52&nbsp;s.</li>
+</ul>
+
+<h2>2. What was built</h2>
+<table>
+  <tr><th>Piece</th><th>Where</th><th>What it does</th></tr>
+  <tr><td>Stuck reads</td><td><code>internal/copier/engine.go</code> (<code>slot</code>, <code>beginRead</code>, <code>endRead</code>,
+      <code>markStuck</code>, <code>stick</code>, <code>unstick</code>)</td>
+      <td>Each worker's read in flight is a slot. Every 20&nbsp;ms the control loop counts reads in flight over
+      <code>StuckAfter</code> (50&nbsp;ms) as stuck, per file and in all. A read ends before its write, so a slow destination
+      never makes a read look stuck.</td></tr>
+  <tr><td>The limit</td><td><code>setLimit</code></td>
+      <td>The gate admits <code>flying + min(stuck, MaxStuck)</code> workers, recomputed whenever either changes. The
+      pool has <code>MaxReaders + MaxStuck</code> workers.</td></tr>
+  <tr><td>Where a read goes</td><td><code>pick</code>, <code>slowFile</code>, <code>fastFile</code>, <code>choose</code>,
+      <code>take</code></td>
+      <td>Three rules in order, at the moment a worker asks (section 3.2).</td></tr>
+  <tr><td>Pull dispatcher</td><td><code>dispatch</code>, <code>worker</code></td>
+      <td>A worker through the gate sends its reply channel on <code>want</code>; the dispatcher picks the chunk then, not
+      ahead of time, so every choice uses the current stuck counts. <code>quit</code> closes when nothing is left.</td></tr>
+  <tr><td>Tuner</td><td><code>internal/tuner/tuner.go</code> (rewritten, about 380 lines, was 930)</td>
+      <td>Sets only the number of flying reads, judged on flying reads alone (section 3.4).</td></tr>
+  <tr><td>Flags</td><td><code>cmd/qclone/main.go</code></td>
+      <td>New <code>--max-stuck N</code> (default 16, 0 to 256). <code>--readers</code> and <code>--max-readers</code> now
+      mean flying reads. <code>--chunk</code> is a plain setting (default 256K). <code>--files</code> is gone (it was never
+      released). <code>--fixed</code> freezes only the flying number.</td></tr>
+  <tr><td>Display</td><td><code>internal/ui/render.go</code>, <code>tui.go</code></td>
+      <td>TUNER line: "4 reads x 256K" while nothing is stuck, else "2 flying + 16 stuck reads x 256K (stuck room full)",
+      counted from the reads in flight right now, then the tuner's state ("holding at 4 flying", "testing more flying
+      reads 4 -&gt; 8" with each arm's rate). The chart's strip shows the reads allowed. The summary ends with the flying
+      number, the changes, and the most reads stuck at once.</td></tr>
+  <tr><td>Diagnostic</td><td><code>internal/copier/diag_test.go</code>, <code>make tuner-diag</code></td>
+      <td>Copies the demo tree through the simulated drive in hash order, dfs order and rclone's shape, and prints each
+      one's time, what was in flight, and every tuner decision.</td></tr>
+  <tr><td>Makefile</td><td><code>Makefile</code></td>
+      <td><code>demo-fixed</code> is now <code>--fixed --readers 4 --chunk 1M --max-stuck 0 --order dfs</code>. Tests build
+      with <code>-trimpath</code> (section 7.3). <code>tuner-diag</code> passes the demo tree as an absolute path.</td></tr>
+  <tr><td>Probe</td><td><code>probe/old-tuner-rule/</code></td>
+      <td>The Monte Carlo models behind section 6.</td></tr>
+  <tr><td>README</td><td><code>README.md</code></td>
+      <td>"It tunes itself" replaced by "Stuck reads don't hold up the rest"; <code>--order</code> and
+      <code>--max-stuck</code> documented.</td></tr>
+</table>
+
+<h2>3. Choices made, and why</h2>
+
+<h3>3.1 What counts as stuck</h3>
+<ul>
+  <li><b>50&nbsp;ms, fixed.</b> A healthy SSD reads 256&nbsp;KiB in about a millisecond; the degraded regions take hundreds
+      of milliseconds or seconds. A plain USB stick (8&nbsp;ms per chunk at 30&nbsp;MB/s) or a disk seek (10&ndash;15&nbsp;ms) stays
+      under it. It's an option in the engine (<code>StuckAfter</code>), not a flag.</li>
+  <li><b>Reads sent to a slow file count as stuck from the start.</b> Otherwise each one would borrow a flying slot for
+      its first 50&nbsp;ms. With 16 slow reads of about half a second each, that's around 30 a second, so the flying reads
+      would lose more than a slot on average.</li>
+  <li><b>A slow file</b> is one with a stuck read, or whose last finished read took over 50&nbsp;ms. When its reads come
+      back fast again (a big file moving into a fresh region), it's a fast file again.</li>
+</ul>
+
+<h3>3.2 Where a read goes (<code>pick</code>)</h3>
+<ol>
+  <li><b>While fewer than <code>MaxStuck</code> are stuck, a slow file's next chunk.</b> It counts as stuck at once, which
+      raises the limit by one, so the flying reads keep their room.</li>
+  <li><b>A file with nothing stuck.</b> A file none of whose reads has finished yet gets one read at a time, so finding out
+      that a new file is slow costs one flying read, not all of them. When no open file has a chunk to give, the next file
+      is opened, while fewer than <code>flying + MaxStuck</code> files are open.</li>
+  <li><b>Otherwise a slow file's chunk</b>, counted as stuck, so no reader idles while there's work.</li>
+</ol>
+<p>Round-robin among the files each rule accepts. The per-file cap of v2 (readers &divide; files) is gone: rule 2 keeps
+flying reads off slow files, and a fast file may take every flying read.</p>
+
+<h3>3.3 Bounds</h3>
+<ul>
+  <li><b>Open files: at most flying + <code>MaxStuck</code></b> (20 by default). Without it, the flying reads would keep
+      opening new files while slow ones piled up half-done, each holding two file descriptors and a part file.</li>
+  <li><b>When everything is slow,</b> rule 3 fills the flying slots too: <code>flying + MaxStuck</code> reads in flight, all
+      stuck (20 by default). This is the "worst case 20" discussed with Q. See 7.1 for when it can be larger.</li>
+</ul>
+
+<h3>3.4 The tuner</h3>
+<ul>
+  <li><b>Only flying reads are measured</b>: the engine records an op only if its read never counted as stuck, and only if
+      it hit no unreadable sectors. Flying reads all read fresh data at about the same speed, so no noise handling is
+      needed.</li>
+  <li><b>A measurement</b> lasts at least 1&nbsp;s and 20 flying reads. It counts ops that began after the last change and
+      ended after the window opened (100&nbsp;ms after the change). If 5&nbsp;s pass without 20, the test is off ("too few
+      flying reads") and the number holds for 10&nbsp;s.</li>
+  <li><b>Climbing</b>: double while each doubling is at least 5% faster than the number before it, measured just before.
+      When one isn't, go back and hold 30&nbsp;s.</li>
+  <li><b>Rechecks</b> every 30&nbsp;s: measure the current number, try double, then half, each against that measurement, and
+      move only to one at least 5% faster. Equal means stay, so it never wanders on noise (a test with 10% jitter per
+      20&nbsp;ms makes at most one change in three minutes). Up paying starts the doubling again.</li>
+  <li><b>Starved</b>: workers waiting for work for 100&nbsp;ms, or less than 10&nbsp;s of work left. Then nothing is measured;
+      a test in progress is called off and the number goes back.</li>
+  <li><b>Removed</b>: the A C A C A rounds, the plausibility check, stretched arms, region memory, the two-generation settle,
+      the fluid window, and the IOKit "disk busy" check.</li>
+</ul>
+
+<h3>3.5 Flags</h3>
+<ul>
+  <li><code>--fixed</code> freezes only the flying number; <code>--max-stuck 0</code> takes away the stuck reads' room.
+      Together, with <code>--readers 4 --chunk 1M</code>, they're rclone's shape (<code>make demo-fixed</code>).</li>
+  <li><code>--max-readers</code> keeps its range (1 to 256) and default (32), now for flying reads. Total reads in flight
+      can reach <code>--max-readers</code> + <code>--max-stuck</code>.</li>
+</ul>
+
+<h2>4. Where the build departs from the request</h2>
+<ul>
+  <li><b>Rule 3</b>: when there's no fast work, the flying slots take slow chunks rather than sit idle. So in a stretch where
+      everything is slow, more than 16 reads are stuck: flying + 16. Q's "if 16 are stuck, don't open more" holds for the
+      stuck reads' own room.</li>
+  <li><b>Reads to slow files count as stuck from the start</b>, not after 50&nbsp;ms (3.1).</li>
+  <li><b>One read at a time for a file with no finished read</b>, and <b>at most flying + 16 open files</b>: neither was in
+      the request; both keep a newly met slow file, or many of them, from swallowing the flying reads.</li>
+</ul>
+
+<h2>5. What was verified, and how</h2>
+<ul>
+  <li><b><code>make test</code></b>: <code>go vet</code>, then 54 tests with the race detector, all passing (the diagnostic
+      is skipped by design). New or rewritten:
+    <ul>
+      <li><code>TestSlowFileGetsTheStuckRoom</code>: a slow file (200&nbsp;ms reads, served in parallel) and 16 fresh ones,
+          4 flying reads. With room for 16 stuck, the slow file had up to 20 reads at once (16, plus the 4 once the fresh
+          files were done), never more than 20 in all, and all 64 fresh chunks were done before the slow file was half
+          done. With no room, the slow file had at most 4, and so did everything.</li>
+      <li><code>TestEverythingStuckStaysWithinTheRoom</code>: every read 100&nbsp;ms; at most 20 in flight (4 + 16), and no
+          read left counted as stuck after the run.</li>
+      <li>Tuner, in virtual time: doubles while it pays and stops at the knee (4&nbsp;&rarr;&nbsp;8&nbsp;&rarr;&nbsp;16, 32
+          not kept); stays when more doesn't help; a recheck moves 16&nbsp;&rarr;&nbsp;8 when more starts to hurt; fixed
+          never moves; starved holds, and starvation mid-test goes back; too few flying reads holds; steady under jitter;
+          ops begun before a change don't count.</li>
+      <li><code>TestOrders</code> (1 flying read, no stuck room) still copies in exact dfs and hash order.</li>
+    </ul></li>
+  <li><b>The built binary on the demo tree</b> (972&nbsp;MB, 362 files, <code>--simulate degraded --plain</code>): done in
+      46&nbsp;s, no errors, and <code>diff -r</code> against the source finds no difference.</li>
+  <li><b><code>make tuner-diag</code></b>, the same tree through the simulated drive:
+    <table>
+      <tr><th>Run</th><th>Time</th><th>Average</th><th>Reads allowed, on average</th><th>Counted stuck, on average</th></tr>
+      <tr><td>hash order (default)</td><td>46&nbsp;s</td><td>21.1&nbsp;MB/s</td><td>19.9</td><td>19.3</td></tr>
+      <tr><td>dfs order</td><td>46&nbsp;s</td><td>21.1&nbsp;MB/s</td><td>19.9</td><td>19.6</td></tr>
+      <tr><td>rclone's shape (4 &times; 1M, no stuck room, fixed)</td><td>151&nbsp;s</td><td>6.4&nbsp;MB/s</td><td>4.0</td><td>3.9</td></tr>
+    </table>
+    For comparison: v2's tuner took 141&nbsp;s in hash order and 54&nbsp;s in dfs order; 0.1.0 took 52&nbsp;s. The tuner made no
+    change in either run: it recorded "too few flying reads" or "starved" each time it tried (7.2 explains why).</li>
+  <li><b>Display</b>: frames from a simulated copy checked by eye; <code>TestFramesFitEveryTerminal</code> still covers
+      widths from 20 columns up.</li>
+</ul>
+
+<h2>6. Why the v2 tuner failed in hash order</h2>
+<p>It scored each candidate by throughput over trials of a second or two. In hash order the open files are a random mix of
+slow and fast ones, and in the simulator a slow read uses the drive's shared bandwidth at 8&nbsp;MB/s against 500&nbsp;MB/s
+for a fast one, so a trial's rate mostly reflected which files were open. Three things in the verdict then made it worse
+(<code>probe/old-tuner-rule/</code> models them):</p>
+<ul>
+  <li><b>The plausibility check clipped the top.</b> For doubled readers it voided any round reading above 2.3&times; or
+      below 0.435&times;, a range centered on "no change". The true gain was 1.79&times;, so a reading 28% too high was
+      thrown out while one 4.1&times; too low still counted, and the surviving rounds averaged low: 1.51&times; at a
+      per-trial spread (sigma) of 0.3, 1.28&times; at 0.5.</li>
+  <li><b>Keeping was hard</b>: more readers needed an average gain above the round's own measured noise and both halves
+      positive. At sigma 0.5, 12% of 4&nbsp;&rarr;&nbsp;8 rounds kept, 19% rejected, 70% thrown out.</li>
+  <li><b>One rejection ended the climb</b>, so the &minus;10% was one ordinary unlucky round.</li>
+</ul>
+<p>Measuring only flying reads removes the cause rather than the symptoms: no stuck read is in the measurement, so the file
+mix isn't either.</p>
+
+<h2>7. Concerns and open issues</h2>
+
+<h3>7.1 When everything is stuck, in flight is flying + 16, and flying may have grown</h3>
+<p>Rule 3 makes a fully slow stretch run <code>flying + 16</code> reads, all stuck. At the default 4 that's 20. But the flying
+number only changes on measurements of flying reads, and with none flying it holds wherever a fast stretch left it: up to 32,
+so up to 48 stuck reads. Q's "don't go past 16 if they're all blocked" suggests a rule such as "with nothing flying for a few
+seconds, the flying number goes back to its start". Not built; Q's call.</p>
+
+<h3>7.2 The simulator can't show the two kinds of read helping each other</h3>
+<p>The simulated drive serves every read through one queue, so with 16 slow reads queued, a fast read waits behind them and
+counts as stuck too. That's why the diagnostic shows almost every read stuck and the tuner never finding enough flying reads
+to test. On that drive model it's harmless: the slow bandwidth is saturated with about 14 reads in flight, and 20 keeps it
+saturated. Showing fresh files flying past slow ones needs either a real drive whose slow reads don't block fast ones, or
+the simulator variant with separate slow and fast resources that v2 proposed. Neither exists yet.
+<code>TestSlowFileGetsTheStuckRoom</code> shows the engine side with sleeps standing in for the drive.</p>
+
+<h3>7.3 A log with home-folder paths (found during this work)</h3>
+<p>The first <code>make tuner-diag</code> run failed (the demo tree's path was relative, and <code>go test</code> runs in the
+package's folder), and the panic's stack trace printed absolute source paths, which include the home folder's name, into
+<code>_logs/tuner-diag-20261013T051638Z.log</code>. The session didn't edit or delete it (it's in <code>~/jorp</code>). The
+cause is fixed: test targets build with <code>-trimpath</code>, so traces name files by module path, and the diagnostic
+passes an absolute path built from <code>$PWD</code> at run time.</p>
+
+<h3>7.4 Not yet done</h3>
+<ul>
+  <li>No run on the real degraded drive. Whether its slow regions speed up with more reads in flight, and whether fast
+      reads wait behind slow ones inside it, decide how much the room for 16 stuck reads buys.</li>
+  <li>No 0.2.0 release. <code>make release VERSION=0.2.0</code> would publish it.</li>
+  <li><code>docs/assets/display-sample-0.1.0.txt</code> shows the old TUNER line.</li>
+</ul>
+
+<h3>7.5 Carried over, still open</h3>
+<ul>
+  <li>Not copied: extended attributes, ACLs, resource forks, Finder tags, hard links. No cloud remotes.</li>
+  <li>Copyright in AI-written code is uncertain, and every commit carries a Claude co-author line.</li>
+</ul>
+
+<h2>8. Assets</h2>
+<ul>
+  <li><code>probe/old-tuner-rule/</code>: the Monte Carlo models for section 6.</li>
+  <li><code>docs/built/qclone-v2-built.html</code>: the previous revision's as-built.</li>
+</ul>
+
+</body>
+</html>
