@@ -198,3 +198,11 @@ failed read takes 200 ms, as on a real drive).
 - A destination file with unreadable spots stays unfinished until you add
   `--rescue`. The hidden `.part`, `.map` and `.bad` files stay in the
   destination until the file is whole.
+
+## License
+
+Copyright © 2026 Qrux. qclone was created by Qrux.
+
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)). Anyone who
+distributes qclone, or a version changed from it, must include the attribution in
+[NOTICE](NOTICE) (section 4(d) of the license).
