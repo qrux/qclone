@@ -339,6 +339,14 @@ func (r *renderer) chart(rows, readerRows int) []*line {
 	cs := r.h.columns(cols, spc(cols, r.h.Seconds()))
 	lo, hi := math.Inf(1), 0.0
 	maxR := r.s.Tuner.Applied.Readers
+	// The scale only ever widens: a range once shown stays, so the chart
+	// doesn't jump about as fast and slow stretches scroll in and out.
+	if r.h.yHi > 0 {
+		lo, hi = r.h.yLo, r.h.yHi
+	}
+	if r.h.rMax > maxR {
+		maxR = r.h.rMax
+	}
 	for _, c := range cs {
 		if c.rate > 0 {
 			lo = math.Min(lo, c.rate)
@@ -348,6 +356,10 @@ func (r *renderer) chart(rows, readerRows int) []*line {
 			maxR = c.readers
 		}
 	}
+	if hi > 0 {
+		r.h.yLo, r.h.yHi = lo, hi
+	}
+	r.h.rMax = maxR
 	var out []*line
 	bottom := ""
 	if hi == 0 {
@@ -458,17 +470,27 @@ func ladder(lo, hi float64, rows int) []float64 {
 }
 
 func settingText(s tuner.Setting) string {
-	return fmt.Sprintf("%d readers x %s", s.Readers, Chunk(s.Chunk))
+	return fmt.Sprintf("%d readers x %s, %s", s.Readers, Chunk(s.Chunk), plural(s.Files, "file"))
 }
 
 func armLabel(dim int, s tuner.Setting) string {
-	if dim == tuner.DimChunk {
+	switch dim {
+	case tuner.DimChunk:
 		return Chunk(s.Chunk)
+	case tuner.DimFiles:
+		return plural(s.Files, "file")
 	}
 	return fmt.Sprintf("%d", s.Readers)
 }
 
 func trialText(dim int, from, to tuner.Setting) string {
+	if dim == tuner.DimFiles {
+		dir := "more"
+		if to.Files < from.Files {
+			dir = "fewer"
+		}
+		return fmt.Sprintf("%s files at once %d -> %d", dir, from.Files, to.Files)
+	}
 	if dim == tuner.DimChunk {
 		dir := "bigger"
 		if to.Chunk < from.Chunk {

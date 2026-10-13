@@ -47,7 +47,11 @@ type Options struct {
 	Errors       *ErrorLog
 	Sim          *sim.Device // pretend the source is this drive
 	Rescue       bool        // install files with unreadable ranges, zeros there
+	Order        plan.Order  // the order files are copied in
 }
+
+// hashWindow is how many found files hash order chooses among.
+const hashWindow = 1024
 
 // Active is one file in flight.
 type Active struct {
@@ -106,6 +110,8 @@ type file struct {
 	meter               *rate.Meter
 	done                atomic.Int64
 	refs                atomic.Int64
+	inflight            atomic.Int64 // chunks handed out and not yet finished
+	key, seq            uint64       // the queue's order: path hash (or seq), then the order found
 
 	once    sync.Once
 	sf, df  *os.File
@@ -190,6 +196,9 @@ type Engine struct {
 	tuner  *tuner.Tuner
 	gate   *gate
 	chunk  atomic.Int64
+	files  atomic.Int64  // files to keep in flight
+	slots  chan struct{} // nudges the dispatcher when a chunk finishes
+	seq    atomic.Uint64
 	global *rate.Meter
 	peak   atomic.Uint64 // float64 bits
 
@@ -241,7 +250,13 @@ func New(p *plan.Plan, opt Options) *Engine {
 	s := e.tuner.Setting()
 	e.gate.setLimit(s.Readers)
 	e.chunk.Store(int64(s.Chunk))
-	e.q.init()
+	e.files.Store(int64(s.Files))
+	e.slots = make(chan struct{}, 1)
+	window := 1
+	if opt.Order == plan.OrderHash {
+		window = hashWindow
+	}
+	e.q.init(window)
 	if p.Overlap {
 		e.seen = map[string]struct{}{}
 	}
@@ -378,7 +393,7 @@ func (e *Engine) scan(ctx context.Context) {
 		e.scanning.Store(false)
 		e.q.close()
 	}()
-	plan.Walk(ctx, e.plan, func(en plan.Entry) bool {
+	plan.Walk(ctx, e.plan, e.opt.Order != plan.OrderDirent, func(en plan.Entry) bool {
 		if en.Err != nil {
 			e.logErr("scan", en.Src, en.Err)
 			return false
@@ -417,6 +432,13 @@ func (e *Engine) scan(ctx context.Context) {
 			}
 			e.filesTotal.Add(1)
 			e.bytesTotal.Add(size)
+			f.seq = e.seq.Add(1)
+			f.key = f.seq
+			if e.opt.Order == plan.OrderHash {
+				h := fnv.New64a()
+				io.WriteString(h, en.Show)
+				f.key = h.Sum64()
+			}
 			e.q.push(f)
 		case m&fs.ModeSymlink != 0:
 			e.copyLink(en)
@@ -545,66 +567,144 @@ func (e *Engine) copyLink(en plan.Entry) {
 	e.links.Add(1)
 }
 
+// openFile is a file the dispatcher is cutting into chunks.
+type openFile struct {
+	f    *file
+	todo ranges // what's left to hand out
+	zero bool   // nothing to read, but one empty job must still go, so it's opened and finished
+}
+
+func (o *openFile) next(chunk int64) job {
+	if o.zero {
+		o.zero = false
+		return job{f: o.f}
+	}
+	g := &o.todo[0]
+	n := chunk
+	if n > g.Len {
+		n = g.Len
+	}
+	j := job{f: o.f, off: g.Off, n: int(n)}
+	g.Off += n
+	g.Len -= n
+	if g.Len == 0 {
+		o.todo = o.todo[1:]
+	}
+	return j
+}
+
+func (o *openFile) exhausted() bool { return !o.zero && len(o.todo) == 0 }
+
+func (e *Engine) startFile(f *file) *openFile {
+	f.started = time.Now()
+	f.meter = rate.New(f.started)
+	f.refs.Store(1) // the dispatcher's own reference
+	e.mu.Lock()
+	e.active[f] = struct{}{}
+	e.mu.Unlock()
+	e.prepare(f)
+	todo := ranges{{0, f.size}}
+	if f.resuming {
+		f.rangeMu.Lock()
+		todo = f.doneSet.gaps(f.size)
+		f.rangeMu.Unlock()
+	}
+	o := &openFile{f: f, todo: todo}
+	if todo.total() == 0 {
+		o.todo, o.zero = nil, true
+	}
+	return o
+}
+
+// dispatch keeps the tuner's number of files open and hands out their chunks
+// in turn. Each open file may have at most readers/files chunks in flight, so
+// a file in a slow region can tie up only its share of the readers while the
+// others keep moving; when it's the only file left, it may have them all.
 func (e *Engine) dispatch(ctx context.Context) {
+	var open []*openFile
 	defer func() {
+		for _, o := range open {
+			o.f.canceled.Store(true)
+			e.release(o.f)
+		}
 		e.dispatchDone.Store(true)
 		close(e.jobs)
 	}()
+	rr, walkDone := 0, false
 	for {
-		e.dispatchIdle.Store(true)
-		f, ok := e.q.pop()
-		e.dispatchIdle.Store(false)
-		if !ok || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
-		f.started = time.Now()
-		f.meter = rate.New(f.started)
-		f.refs.Store(1) // the dispatcher's own reference
-		e.mu.Lock()
-		e.active[f] = struct{}{}
-		e.mu.Unlock()
-		e.prepare(f)
-		todo := ranges{{0, f.size}}
-		if f.resuming {
-			f.rangeMu.Lock()
-			todo = f.doneSet.gaps(f.size)
-			f.rangeMu.Unlock()
+		for !walkDone && len(open) < int(e.files.Load()) {
+			f, done := e.q.tryPop(time.Now())
+			if f == nil {
+				walkDone = done
+				break
+			}
+			open = append(open, e.startFile(f))
 		}
-		sent := false
-		send := func(j job) bool {
-			f.refs.Add(1)
-			select {
-			case e.jobs <- j:
-				sent = true
-				return true
-			case <-ctx.Done():
-				f.refs.Add(-1)
-				f.canceled.Store(true)
-				return false
+		if len(open) == 0 {
+			if walkDone {
+				return
+			}
+			e.dispatchIdle.Store(true)
+			e.wait(ctx)
+			e.dispatchIdle.Store(false)
+			continue
+		}
+		limit := (e.gate.limitNow() + len(open) - 1) / len(open)
+		var o *openFile
+		for i := range open {
+			k := (rr + i) % len(open)
+			if open[k].f.inflight.Load() < int64(limit) {
+				o, rr = open[k], k+1
+				break
 			}
 		}
-	cut:
-		for _, g := range todo {
-			for off := g.Off; off < g.end(); {
-				n := int64(e.chunk.Load())
-				if rem := g.end() - off; n > rem {
-					n = rem
-				}
-				if !send(job{f: f, off: off, n: int(n)}) {
-					e.release(f)
-					return
-				}
-				off += n
-				if f.failed.Load() {
-					break cut
-				}
-			}
+		if o == nil {
+			e.wait(ctx) // every open file has its share in flight
+			continue
 		}
-		if !sent && !send(job{f: f}) { // nothing to read (empty, or done before): still open and finish
-			e.release(f)
+		j := o.next(e.chunk.Load())
+		o.f.refs.Add(1)
+		o.f.inflight.Add(1)
+		select {
+		case e.jobs <- j:
+		case <-ctx.Done():
+			o.f.refs.Add(-1)
+			o.f.inflight.Add(-1)
 			return
 		}
-		e.release(f)
+		if o.exhausted() || o.f.failed.Load() || o.f.canceled.Load() {
+			for k := range open {
+				if open[k] == o {
+					open = append(open[:k], open[k+1:]...)
+					break
+				}
+			}
+			e.release(o.f)
+		}
+	}
+}
+
+// wait sleeps until a chunk finishes, a file arrives, or a moment passes.
+func (e *Engine) wait(ctx context.Context) {
+	t := time.NewTimer(windowPatience)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-e.q.kick:
+	case <-e.slots:
+	case <-t.C:
+	}
+}
+
+// finished tells the dispatcher a chunk of f is done, freeing its share.
+func (e *Engine) finished(f *file) {
+	f.inflight.Add(-1)
+	select {
+	case e.slots <- struct{}{}:
+	default:
 	}
 }
 
@@ -620,6 +720,7 @@ func (e *Engine) worker(ctx context.Context, id int) {
 		if ctx.Err() != nil {
 			e.gate.release()
 			j.f.canceled.Store(true)
+			e.finished(j.f)
 			e.release(j.f)
 			continue
 		}
@@ -637,6 +738,7 @@ func (e *Engine) worker(ctx context.Context, id int) {
 		}
 		e.opStart[id].Store(0)
 		e.gate.release()
+		e.finished(j.f)
 		e.release(j.f)
 	}
 }
@@ -978,6 +1080,7 @@ func (e *Engine) control(stop <-chan struct{}) {
 			s := e.tuner.Step(p)
 			e.gate.setLimit(s.Readers)
 			e.chunk.Store(int64(s.Chunk))
+			e.files.Store(int64(s.Files))
 			if r, ok := e.global.Rate(now); ok {
 				for {
 					old := e.peak.Load()

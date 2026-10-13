@@ -238,3 +238,47 @@ func TestRescueCountsShown(t *testing.T) {
 		}
 	}
 }
+
+// Once the chart has shown a range, later frames never narrow it, even when
+// the extremes have been averaged into wider columns.
+func TestChartScaleOnlyWidens(t *testing.T) {
+	now := time.Now()
+	s := fakeSnapshot(now)
+	start := now.Add(-3000 * time.Second)
+	s.Start = start
+	h := NewHistory(start)
+	axis := func() string {
+		var labels []string
+		for _, l := range Render(Frame{W: 110, H: 44}, s, h) {
+			v := stripANSI(l)
+			if len(v) > 8 && (v[7] == '|' || v[7] == '+') {
+				labels = append(labels, strings.TrimSpace(v[:7]))
+			}
+		}
+		return strings.Join(labels, " ")
+	}
+	for i := 0; i < 100; i++ { // wild: 2 MB/s and 500 MB/s, second by second
+		r := 2e6
+		if i%2 == 0 {
+			r = 500e6
+		}
+		h.Record(start.Add(time.Duration(i)*time.Second), r, true, 4)
+	}
+	s.Now = start.Add(100 * time.Second)
+	first := axis()
+	for i := 100; i < 3000; i++ { // then a long, steady 50 MB/s
+		h.Record(start.Add(time.Duration(i)*time.Second), 50e6, true, 4)
+	}
+	s.Now = start.Add(3000 * time.Second)
+	if later := axis(); later != first {
+		t.Fatalf("scale changed:\n first %s\n later %s", first, later)
+	}
+	fresh := NewHistory(start)
+	for i := 100; i < 3000; i++ {
+		fresh.Record(start.Add(time.Duration(i)*time.Second), 50e6, true, 4)
+	}
+	h = fresh
+	if narrow := axis(); narrow == first {
+		t.Fatal("test is not testing anything: a steady run alone shows the same scale")
+	}
+}

@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -195,10 +196,43 @@ type Entry struct {
 	Err  error // the walk could not read this path
 }
 
-// Walk visits every root in order, parents before children. A directory that
-// can't be read is reported with Err set and skipped; the walk goes on. When
-// visit returns false for a directory, its contents are skipped.
-func Walk(ctx context.Context, p *Plan, visit func(Entry) bool) error {
+// Order is the order files are copied in.
+type Order int
+
+const (
+	// OrderHash copies in order of a hash of each path, within a window of the
+	// next 1,024 files found: files from different folders, and so usually from
+	// different times and different parts of the drive, are in flight together.
+	OrderHash Order = iota
+	// OrderDFS is depth first, names sorted within each folder.
+	OrderDFS
+	// OrderDirent is depth first, in the order the file system lists each
+	// folder (on APFS that is already a hash of the names; on exFAT, roughly
+	// creation order).
+	OrderDirent
+)
+
+// ParseOrder reads --order.
+func ParseOrder(s string) (Order, error) {
+	switch s {
+	case "hash":
+		return OrderHash, nil
+	case "dfs":
+		return OrderDFS, nil
+	case "dirent":
+		return OrderDirent, nil
+	}
+	return 0, fmt.Errorf("--order must be hash, dfs or dirent, not %q", s)
+}
+
+func (o Order) String() string { return [...]string{"hash", "dfs", "dirent"}[o] }
+
+// Walk visits every root in order, parents before children: names sorted
+// within each folder, unless sorted is false (then in the file system's own
+// order). A directory that can't be read is reported with Err set and skipped;
+// the walk goes on. When visit returns false for a directory, its contents
+// are skipped.
+func Walk(ctx context.Context, p *Plan, sorted bool, visit func(Entry) bool) error {
 	for i, r := range p.Roots {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -210,31 +244,66 @@ func Walk(ctx context.Context, p *Plan, visit func(Entry) bool) error {
 		}
 		top := r.Src
 		if r.Contents {
-			// A trailing slash follows a link to a directory; WalkDir would not.
+			// A trailing slash follows a link to a directory.
 			if t, err := filepath.EvalSymlinks(r.Src); err == nil {
 				top = t
 			}
 		}
-		walkErr := filepath.WalkDir(top, func(path string, d fs.DirEntry, err error) error {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
+		i, r := i, r
+		err := walkTree(ctx, top, sorted, func(path string, info fs.FileInfo, err error) bool {
 			rel, _ := filepath.Rel(top, path)
 			if rel == "." {
 				rel = ""
 			}
-			e := Entry{Root: i, Src: path, Dst: filepath.Join(r.Dst, rel), Show: filepath.Join(r.Label, rel), Rel: rel, Err: err}
-			if err == nil {
-				e.Info, e.Err = d.Info()
-			}
-			keep := visit(e)
-			if d != nil && d.IsDir() && (e.Err != nil || !keep) {
-				return fs.SkipDir
-			}
-			return nil
+			return visit(Entry{Root: i, Src: path, Dst: filepath.Join(r.Dst, rel), Show: filepath.Join(r.Label, rel), Rel: rel, Info: info, Err: err})
 		})
-		if walkErr != nil && ctx.Err() != nil {
-			return ctx.Err()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func walkTree(ctx context.Context, top string, sorted bool, fn func(string, fs.FileInfo, error) bool) error {
+	info, err := os.Lstat(top)
+	if err != nil {
+		fn(top, nil, err)
+		return nil
+	}
+	return walkFrom(ctx, top, info, sorted, fn)
+}
+
+// walkFrom visits path, then (for a directory fn kept) everything under it.
+// A directory that can't be listed is visited a second time, with the error.
+func walkFrom(ctx context.Context, path string, info fs.FileInfo, sorted bool, fn func(string, fs.FileInfo, error) bool) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if !fn(path, info, nil) || !info.IsDir() {
+		return nil
+	}
+	f, err := os.Open(path)
+	var ents []fs.DirEntry
+	if err == nil {
+		ents, err = f.ReadDir(-1)
+		f.Close()
+	}
+	if err != nil {
+		fn(path, info, err)
+		return nil
+	}
+	if sorted {
+		sort.Slice(ents, func(a, b int) bool { return ents[a].Name() < ents[b].Name() })
+	}
+	for _, e := range ents {
+		child := filepath.Join(path, e.Name())
+		fi, err := e.Info()
+		if err != nil {
+			fn(child, nil, err)
+			continue
+		}
+		if err := walkFrom(ctx, child, fi, sorted, fn); err != nil {
+			return err
 		}
 	}
 	return nil

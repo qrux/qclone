@@ -26,7 +26,7 @@ DEMO   := build/demo
 BUILD_VERSION := $(shell git -C $(ROOT) describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
 GOBUILD = go build -trimpath -ldflags "-s -w -X main.version=$(or $(BUILD_VERSION),dev)"
 .DEFAULT_GOAL := help
-.PHONY: help build test demo demo-fixed demo-rescue install license-probe release brew-check
+.PHONY: help build test demo demo-fixed demo-rescue install license-probe release brew-check tuner-diag
 
 help:
 	@grep -E '^## ' $(firstword $(MAKEFILE_LIST)) | sed 's/^## /  /'
@@ -46,9 +46,10 @@ test:
 demo:
 	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
 
-## demo-fixed: the same copy at rclone's default of 4 readers, never tuned, to compare
+## demo-fixed: the same copy the way rclone copies: 4 files at once, one read each, in order,
+##   never tuned, to compare
 demo-fixed:
-	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --fixed --readers 4 --chunk 1M --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
+	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --fixed --readers 4 --chunk 1M --files 4 --order dfs --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
 
 ## demo-rescue: the copy from a simulated failing SSD that has some unreadable sectors: once
 ##   plain (unreadable spots mapped to 4 KiB, those files kept unfinished), then again with
@@ -80,3 +81,9 @@ release:
 brew-check:
 	@cd $(ROOT) && owner=$$(git remote get-url origin | sed -E 's#^git@[^:]+:([^/]+)/.*#\1#') && \
 	$(CLEANLOGGED) sh -c "brew tap $$owner/tap && brew audit --strict --online $$owner/tap/qclone && brew install --build-from-source $$owner/tap/qclone && brew test $$owner/tap/qclone && qclone --version"
+
+## tuner-diag: copy the demo tree through the simulated drive and print every tuner decision
+##   (hash and dfs order), then what pinned settings achieve; several minutes. For working on
+##   the tuner, not a test.
+tuner-diag:
+	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && QCLONE_DIAG_SRC=$(DEMO)/src go test -count=1 -run "TestDiag" -v -timeout 30m ./internal/copier/'

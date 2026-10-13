@@ -128,7 +128,7 @@ func fast() sim.Region {
 	return sim.Region{OpRate: 300e6, Bandwidth: 500e6, Overhead: 100 * time.Microsecond}
 }
 
-func start() Setting { return Setting{Readers: 4, Chunk: 1 << 20} }
+func start() Setting { return Setting{Readers: 4, Chunk: 1 << 20, Files: 1} }
 
 func TestClimbsWhenSlowRegionScales(t *testing.T) {
 	v := newVsim(DefaultConfig(), start(), func(int64) sim.Region { return slowScalable() })

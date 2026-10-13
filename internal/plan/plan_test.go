@@ -123,7 +123,7 @@ func TestWalkMultipleRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got []string
-	Walk(context.Background(), p, func(e Entry) bool {
+	Walk(context.Background(), p, true, func(e Entry) bool {
 		if e.Err != nil {
 			t.Fatalf("walk error at %s: %v", e.Src, e.Err)
 		}
@@ -145,7 +145,7 @@ func TestWalkFollowsLinkWithSlash(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := 0
-	Walk(context.Background(), p, func(e Entry) bool {
+	Walk(context.Background(), p, true, func(e Entry) bool {
 		if e.Err == nil && e.Info.Mode().IsRegular() {
 			n++
 		}
@@ -166,7 +166,7 @@ func TestWalkReportsUnreadableDirectory(t *testing.T) {
 	defer os.Chmod(locked, 0o755)
 	p, _ := Resolve([]string{filepath.Join(base, "source"), filepath.Join(base, "dst")})
 	errs, files := 0, 0
-	Walk(context.Background(), p, func(e Entry) bool {
+	Walk(context.Background(), p, true, func(e Entry) bool {
 		if e.Err != nil {
 			errs++
 		} else if e.Info.Mode().IsRegular() {
@@ -176,5 +176,37 @@ func TestWalkReportsUnreadableDirectory(t *testing.T) {
 	})
 	if errs != 1 || files != 1 {
 		t.Fatalf("errors %d files %d; want 1 and 1", errs, files)
+	}
+}
+
+func TestWalkOrders(t *testing.T) {
+	base := t.TempDir()
+	for _, n := range []string{"c", "a", "b"} {
+		os.WriteFile(filepath.Join(base, n), nil, 0o644)
+	}
+	p, _ := Resolve([]string{base + "/", filepath.Join(t.TempDir(), "dst")})
+	names := func(sorted bool) string {
+		var got []string
+		Walk(context.Background(), p, sorted, func(e Entry) bool {
+			if e.Rel != "" {
+				got = append(got, e.Rel)
+			}
+			return true
+		})
+		return strings.Join(got, "")
+	}
+	if got := names(true); got != "abc" {
+		t.Fatalf("sorted walk = %q", got)
+	}
+	if got := names(false); len(got) != 3 {
+		t.Fatalf("unsorted walk = %q, want all three in any order", got)
+	}
+	for in, want := range map[string]Order{"hash": OrderHash, "dfs": OrderDFS, "dirent": OrderDirent} {
+		if o, err := ParseOrder(in); err != nil || o != want || o.String() != in {
+			t.Errorf("ParseOrder(%q) = %v, %v", in, o, err)
+		}
+	}
+	if _, err := ParseOrder("random"); err == nil {
+		t.Error("ParseOrder accepted an unknown order")
 	}
 }

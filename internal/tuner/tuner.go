@@ -38,19 +38,23 @@ import (
 type Setting struct {
 	Readers int // reads in flight at once
 	Chunk   int // bytes per read
+	Files   int // files being read at once; each may hold up to Readers/Files of the reads
 }
 
 // Dimensions of the search.
 const (
 	DimReaders = 0
 	DimChunk   = 1
+	DimFiles   = 2
+	numDims    = 3
 )
 
 // Config bounds the search. Times are wall-clock durations.
 type Config struct {
-	MinReaders, MaxReaders int
-	MinChunk, MaxChunk     int
-	TuneReaders, TuneChunk bool
+	MinReaders, MaxReaders            int
+	MinChunk, MaxChunk                int
+	MinFiles, MaxFiles                int
+	TuneReaders, TuneChunk, TuneFiles bool
 
 	Warmup     time.Duration // before the first round
 	MinMeasure time.Duration // shortest arm
@@ -65,7 +69,8 @@ func DefaultConfig() Config {
 	return Config{
 		MinReaders: 1, MaxReaders: 32,
 		MinChunk: 128 << 10, MaxChunk: 8 << 20,
-		TuneReaders: true, TuneChunk: true,
+		MinFiles: 1, MaxFiles: 32,
+		TuneReaders: true, TuneChunk: true, TuneFiles: true,
 		Warmup:     2 * time.Second,
 		MinMeasure: 1 * time.Second,
 		MaxMeasure: 20 * time.Second,
@@ -229,8 +234,9 @@ func (d *dimState) setTried(dir int) {
 func (d *dimState) reset() { d.triedUp, d.triedDown, d.converged = false, false, false }
 
 type regime struct {
-	level float64 // log bytes/s at best
-	best  Setting
+	level     float64 // log bytes/s at best
+	best      Setting
+	confirmed bool // best was kept by a test here, not just carried in
 }
 
 // Thresholds, as log ratios.
@@ -246,7 +252,13 @@ var (
 	earlyGap       = math.Log(1.25) // A C A already shows 25% either way: decide now
 	slowOp         = 0.5            // seconds per read above which the chunk is not grown
 	plausibleSlack = math.Log(1.15)
-	earlyStable    = math.Log(1.2) // ...provided the two A arms agree within 20%
+	noisyRound     = math.Log(1.10) // A arms off a straight line by more: lengthen arms
+	quietRound     = math.Log(1.03) // ...by less: shorten them again
+	maxStretch     = 16.0
+	statusHistory  = 64             // decisions a Status carries (the display shows the last; diagnostics print them all)
+	filesGain      = math.Log(1.03) // more files in flight must buy 3% (more partial files at a time)
+	filesLoss      = math.Log(1.02) // fewer may cost up to 2%
+	earlyStable    = math.Log(1.1)  // ...provided the two A arms agree within 10%
 )
 
 // Tuner is safe for concurrent use: Record from the workers, Step from one control loop.
@@ -259,7 +271,7 @@ type Tuner struct {
 	lastApplied time.Duration
 	phase       phase
 
-	dims      [2]dimState
+	dims      [numDims]dimState
 	preferDim int
 	dim, dir  int
 	cand      Setting
@@ -267,7 +279,9 @@ type Tuner struct {
 	armIdx    int
 	earlyDone bool
 	roundAt   time.Duration
-	explore   bool // double readers per step until the first overshoot
+	explore   bool    // double readers per step until the first overshoot
+	stretch   float64 // arm length multiplier: grows while results are noisy
+	lastNoise float64 // the last full round's noise; NaN before one
 
 	open []*window // windows still taking op attribution
 
@@ -292,14 +306,10 @@ type Tuner struct {
 // New returns a tuner starting at start. With fixed set, it never moves.
 func New(cfg Config, start Setting, fixed bool) *Tuner {
 	start = clampSetting(cfg, start)
-	t := &Tuner{cfg: cfg, fixed: fixed, cur: start, out: start, baseline: math.NaN(), restDur: cfg.MinRest, explore: true}
-	t.dims[DimReaders].dir = +1
-	t.dims[DimChunk].dir = +1
-	if !cfg.TuneReaders {
-		t.dims[DimReaders].converged = true
-	}
-	if !cfg.TuneChunk {
-		t.dims[DimChunk].converged = true
+	t := &Tuner{cfg: cfg, fixed: fixed, cur: start, out: start, baseline: math.NaN(), restDur: cfg.MinRest, explore: true, stretch: 1, lastNoise: math.NaN()}
+	for i := range t.dims {
+		t.dims[i].dir = +1
+		t.dims[i].converged = !t.tunable(i)
 	}
 	return t
 }
@@ -307,6 +317,7 @@ func New(cfg Config, start Setting, fixed bool) *Tuner {
 func clampSetting(cfg Config, s Setting) Setting {
 	s.Readers = clampInt(s.Readers, cfg.MinReaders, cfg.MaxReaders)
 	s.Chunk = clampInt(s.Chunk, cfg.MinChunk, cfg.MaxChunk)
+	s.Files = clampInt(s.Files, cfg.MinFiles, cfg.MaxFiles)
 	return s
 }
 
@@ -408,8 +419,18 @@ func (t *Tuner) apply(s Setting, now time.Duration) {
 	}
 }
 
+// measureFor is how long an arm measures: stretched while results are noisy.
 func (t *Tuner) measureFor() time.Duration {
-	d := time.Duration(1.5 * t.latEWMA * float64(time.Second))
+	return t.clampMeasure(time.Duration(float64(t.baseMeasure()) * t.stretch))
+}
+
+// baseMeasure is how long it takes to see a setting's effect at all; the
+// checks for a change of region between tests use it unstretched.
+func (t *Tuner) baseMeasure() time.Duration {
+	return t.clampMeasure(time.Duration(1.5 * t.latEWMA * float64(time.Second)))
+}
+
+func (t *Tuner) clampMeasure(d time.Duration) time.Duration {
 	if d < t.cfg.MinMeasure {
 		d = t.cfg.MinMeasure
 	}
@@ -443,7 +464,7 @@ func (t *Tuner) watch(p Probe) {
 		return
 	}
 	if t.monitor.t1 < 0 {
-		if p.Now-t.monitor.t0 >= t.measureFor() {
+		if p.Now-t.monitor.t0 >= t.baseMeasure() {
 			t.closeWindow(t.monitor, p)
 		}
 		return
@@ -487,6 +508,12 @@ func (t *Tuner) candidate(dim, dir int) Setting {
 			}
 			c.Readers = clampInt(n-step, t.cfg.MinReaders, t.cfg.MaxReaders)
 		}
+	} else if dim == DimFiles {
+		if dir > 0 {
+			c.Files = clampInt(c.Files*2, t.cfg.MinFiles, t.cfg.MaxFiles)
+		} else {
+			c.Files = clampInt(c.Files/2, t.cfg.MinFiles, t.cfg.MaxFiles)
+		}
 	} else {
 		if dir > 0 {
 			if t.latEWMA > slowOp {
@@ -504,7 +531,8 @@ func (t *Tuner) candidate(dim, dir int) Setting {
 func (t *Tuner) fileBound() bool { return t.bytesEWMA < 0.5*float64(t.cur.Chunk) }
 
 func (t *Tuner) pickRound() (dim, dir int, c Setting, ok bool) {
-	for _, d := range [2]int{t.preferDim, 1 - t.preferDim} {
+	for k := 0; k < numDims; k++ {
+		d := (t.preferDim + k) % numDims
 		ds := &t.dims[d]
 		if ds.converged || (d == DimChunk && t.fileBound()) {
 			continue
@@ -531,12 +559,7 @@ func (t *Tuner) startRound(p Probe) {
 		// Converged everywhere: hold for a while, then look again from scratch.
 		for i := range t.dims {
 			t.dims[i].reset()
-		}
-		if !t.cfg.TuneReaders {
-			t.dims[DimReaders].converged = true
-		}
-		if !t.cfg.TuneChunk {
-			t.dims[DimChunk].converged = true
+			t.dims[i].converged = !t.tunable(i)
 		}
 		d := t.restDur
 		t.restDur *= 2
@@ -646,6 +669,16 @@ func (t *Tuner) evaluate(p Probe) {
 	mean := (s1 + s2) / 2
 	worst := math.Min(s1, s2)
 	noise := math.Abs(a1-2*a2+a3) / 2
+	t.lastNoise = noise
+	// A mixed workload (hash order puts slow and fast files side by side)
+	// makes short arms measure which files happened to be open, not the
+	// setting. Lengthen arms while the A arms disagree; ease back when quiet.
+	switch {
+	case noise > noisyRound:
+		t.stretch = math.Min(t.stretch*2, maxStretch)
+	case noise < quietRound:
+		t.stretch = math.Max(1, t.stretch*0.75)
+	}
 
 	var keep bool
 	switch {
@@ -653,6 +686,10 @@ func (t *Tuner) evaluate(p Probe) {
 		keep = mean > math.Max(upGain, noise) && worst > 0
 	case t.dim == DimReaders:
 		keep = (mean > -downLoss && worst > -downWorst) || (mean > math.Max(upGain, noise) && worst > 0)
+	case t.dim == DimFiles && t.dir > 0:
+		keep = mean > math.Max(filesGain, noise) && worst > 0
+	case t.dim == DimFiles:
+		keep = (mean > -filesLoss && worst > -downWorst) || (mean > math.Max(filesGain, noise) && worst > 0)
 	case t.dir > 0:
 		keep = mean > math.Max(chunkGain, noise) && worst > 0
 	default:
@@ -670,11 +707,19 @@ func (t *Tuner) conclude(p Probe, keep bool, gain, levelA, levelC float64, how s
 	if keep {
 		d.Note = "kept"
 		t.cur = t.cand
+		defer func() {
+			if t.curReg != nil {
+				t.curReg.confirmed = true
+			}
+		}()
 		t.changes++
 		t.baseline = levelC
 		ds.triedUp, ds.triedDown = false, false
-		if t.tunable(1 - t.dim) {
-			t.dims[1-t.dim].reset() // the other dimension's best may have moved
+		for i := range t.dims {
+			if i != t.dim {
+				t.dims[i].reset() // the other dimensions' best may have moved
+				t.dims[i].converged = !t.tunable(i)
+			}
 		}
 		t.preferDim = t.dim // momentum: same dimension, same direction
 		t.restDur = t.cfg.MinRest
@@ -687,7 +732,7 @@ func (t *Tuner) conclude(p Probe, keep bool, gain, levelA, levelC float64, how s
 		ds.setTried(t.dir)
 		if ds.triedUp && ds.triedDown {
 			ds.converged = true
-			t.preferDim = 1 - t.dim
+			t.preferDim = (t.dim + 1) % numDims
 		} else {
 			ds.dir = -t.dir
 		}
@@ -702,6 +747,9 @@ func (t *Tuner) conclude(p Probe, keep bool, gain, levelA, levelC float64, how s
 // difference is too big to be noise, which halves the time a round takes
 // when it matters most: climbing out of a slow region.
 func (t *Tuner) early(p Probe) bool {
+	if t.stretch > 1 || !(t.lastNoise < quietRound) {
+		return false // no shortcuts until a full round has measured quiet
+	}
 	var x [3]float64
 	for i, a := range t.arms[:3] {
 		r := a.win.rate()
@@ -736,6 +784,11 @@ func (t *Tuner) early(p Probe) bool {
 // can at most halve it). A bigger jump means the C arm fell into a different
 // region of the drive than the A arms around it.
 func (t *Tuner) plausible(score float64) bool {
+	if t.dim == DimFiles {
+		// No such bound: a second file in flight can be a fast one beside a slow
+		// one, and gain far more than twice.
+		return true
+	}
 	a, c := float64(t.cur.Readers), float64(t.cand.Readers)
 	if t.dim == DimChunk {
 		a, c = float64(t.cur.Chunk), float64(t.cand.Chunk)
@@ -752,10 +805,13 @@ func (t *Tuner) closeOpen(p Probe) {
 }
 
 func (t *Tuner) tunable(dim int) bool {
-	if dim == DimReaders {
+	switch dim {
+	case DimReaders:
 		return t.cfg.TuneReaders
+	case DimChunk:
+		return t.cfg.TuneChunk
 	}
-	return t.cfg.TuneChunk
+	return t.cfg.TuneFiles
 }
 
 func (t *Tuner) inconclusive(p Probe, note string) {
@@ -800,7 +856,7 @@ func (t *Tuner) regimeChange(p Probe, x float64) {
 	}
 	slower := math.IsNaN(t.baseline) || x < t.baseline
 	if match != nil {
-		if match.best != t.cur {
+		if match.confirmed && match.best != t.cur {
 			t.addHistory(Decision{At: p.Now, Dim: DimReaders, From: t.cur, To: match.best, Gain: math.NaN(), Kept: true, Note: "jumped"})
 			t.cur = match.best
 			t.changes++
@@ -821,6 +877,7 @@ func (t *Tuner) regimeChange(p Probe, x float64) {
 	// A slower region is where more reads in flight tend to pay; try that first.
 	if slower {
 		t.dims[DimReaders].dir = +1
+		t.dims[DimFiles].dir = +1
 		t.explore = true
 	} else {
 		t.dims[DimReaders].dir = -1
@@ -864,8 +921,8 @@ func (t *Tuner) Status(now time.Duration) Status {
 		}
 	}
 	n := len(t.history)
-	if n > 8 {
-		n = 8
+	if n > statusHistory {
+		n = statusHistory
 	}
 	st.History = append([]Decision(nil), t.history[len(t.history)-n:]...)
 	for _, r := range t.regimes {

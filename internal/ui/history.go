@@ -9,6 +9,10 @@ type History struct {
 	secs    []sample
 	pending sample
 	n       int
+
+	// The widest the chart's scale has been: it never narrows again.
+	yLo, yHi float64
+	rMax     int
 }
 
 type sample struct {

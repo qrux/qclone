@@ -34,8 +34,14 @@ Files already at DST with the same size and modification time are skipped.
 flags:
   -j, --readers N      reads in flight at the start (default 4)
       --max-readers N  most reads in flight the tuner may use (default 32)
+      --files N        files read at once at the start (default 4); each may hold
+                       up to readers/files of the reads, so one slow file can't
+                       hold them all
       --chunk SIZE     bytes per read, e.g. 256K, 4M; fixes it (default: tuned, from 256K)
-      --fixed          don't tune: keep --readers and --chunk as given
+      --order ORDER    hash (default): by a hash of each path, among the next 1,024
+                       files found, to mix old and new data; dfs: depth first,
+                       names sorted; dirent: depth first, as the disk lists them
+      --fixed          don't tune: keep --readers, --chunk and --files as given
       --errors FILE    where errors go (default: <timestamp>-qclone-errors.txt here)
       --rescue         install files that have unreadable spots, with zeros there
                        (each spot is listed in the error file; a later run
@@ -120,6 +126,8 @@ func run(args []string) (code int) {
 	fs.IntVar(&readers, "readers", 4, "")
 	fs.IntVar(&readers, "j", 4, "")
 	maxReaders := fs.Int("max-readers", 32, "")
+	filesN := fs.Int("files", 4, "")
+	orderFlag := fs.String("order", "hash", "")
 	chunkFlag := fs.String("chunk", "", "")
 	fixed := fs.Bool("fixed", false, "")
 	errPath := fs.String("errors", "", "")
@@ -172,12 +180,23 @@ func run(args []string) (code int) {
 	if !set["readers"] && !set["j"] && readers > *maxReaders {
 		readers = *maxReaders // only the default was over the cap
 	}
+	if !set["files"] && *filesN > *maxReaders {
+		*filesN = *maxReaders
+	}
+	if *filesN < 1 || *filesN > *maxReaders {
+		return bad("--files must be 1 to --max-readers (%d)", *maxReaders)
+	}
+	order, err := plan.ParseOrder(*orderFlag)
+	if err != nil {
+		return bad("%v", err)
+	}
 	if readers < 1 || readers > *maxReaders {
 		return bad("--readers must be 1 to --max-readers (%d)", *maxReaders)
 	}
 	cfg := tuner.DefaultConfig()
 	cfg.MaxReaders = *maxReaders
-	start := tuner.Setting{Readers: readers, Chunk: 256 << 10}
+	cfg.MaxFiles = *maxReaders // more files than reads in flight would idle some
+	start := tuner.Setting{Readers: readers, Chunk: 256 << 10, Files: *filesN}
 	if *chunkFlag != "" {
 		n, err := parseSize(*chunkFlag)
 		if err != nil {
@@ -242,6 +261,7 @@ func run(args []string) (code int) {
 		Errors:       errLog,
 		Sim:          dev,
 		Rescue:       *rescue,
+		Order:        order,
 	})
 	hist := ui.NewHistory(eng.Snapshot().Start)
 	var tui *ui.TUI
