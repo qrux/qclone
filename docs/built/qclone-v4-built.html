@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qclone v4 as built</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#5f6368; --bg:#ffffff; --code:#f4f4f6; --rule:#d9d9de; --accent:#0a5bd3; --warn:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e8ea; --muted:#a1a1a8; --bg:#161618; --code:#232327; --rule:#38383d; --accent:#6aa5ff; --warn:#ff8a80; } }
+  body { font: 16px/1.55 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg); max-width: 50rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.8rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.3rem; margin-top: 2.2rem; border-bottom: 1px solid var(--rule); padding-bottom: .2rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.4rem; }
+  .meta { color: var(--muted); margin-top: 0; }
+  code, pre { font: 14px/1.45 ui-monospace, Menlo, monospace; background: var(--code); border-radius: 4px; }
+  code { padding: 0 .25em; }
+  pre { padding: .7rem .9rem; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: 15px; }
+  th, td { border: 1px solid var(--rule); padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  th { background: var(--code); }
+  .note { border-left: 3px solid var(--accent); padding: .2rem .8rem; color: var(--muted); }
+  .warn { border-left: 3px solid var(--warn); padding: .2rem .8rem; }
+</style>
+</head>
+<body>
+
+<h1>qclone v4, as built</h1>
+<p class="meta">2026-10-13 &middot; repo <code>~/proj/qrux/qclone</code> (github.com/qrux/qclone) &middot; not yet released (the
+Homebrew tap still serves 0.1.0) &middot; written by the Claude Code session that built it</p>
+
+<p class="note">This covers what changed after <a href="qclone-v3-built.html">qclone-v3-built.html</a> (code at <code>9cab425</code>,
+documented at <code>4db68a6</code>). Everything in v1 to v3 still holds unless this document says otherwise; in particular v3's
+"stuck room" (flying + min(stuck, 16)) is replaced. As before, there was no spec: the design came out of a conversation with Q on
+2026-10-13, quoted below.</p>
+
+<div class="note"><p><b>In one line:</b> each 32&nbsp;MiB of a file is a region, judged fresh or slow by its reads. Reads in
+flight never exceed a queue length Q measured at the start. Within it, a slow lane of R reads (measured, at most Q&nbsp;&minus;&nbsp;4)
+is kept for slow regions; W flying reads take fresh regions; when there's no fresh work, tries probe unknown regions breadth
+first; and until something fresh turns up, slow reads fill every slot left. Once fresh work exists, slow reads back off to R.
+Demo on the simulated drive: 48&nbsp;s in hash order, no errors, byte-identical.</p></div>
+
+<h2>1. What was asked</h2>
+<p>The v3 design capped stuck reads at 16 beside an uncapped flying number. Q pointed out it couldn't hold: any read can turn
+out stuck, so stuck reads grow past any cap, and on a SATA drive every slot of its 32-command queue can end up holding one.
+The conversation that followed, in Q's words:</p>
+<ul>
+  <li>"For stuck reads, they go into a room where they can only occupy up to 32 slots. Then, one by one, down to the size of
+      the 'stuck room' (which should be determined by *ACTUALLY* parallel the drive is ...), where the stuck reads manually ...
+      sit in a queue, so that qclone is 'piling them into a queue' rather than NCQ or macOS. This leave room to add new
+      attempts in those freed slots."</li>
+  <li>"But we're assuming drive/enclosure properties. Isn't there some way to get a handle on what the *ACTUAL* values
+      are?"</li>
+  <li>"Briefly above R, but always below (or at) NCQ. Once we reach NCQ = S (stuck readers), then YOU/qclone MANUALLY backs
+      them off ... Those files ... are basically 'quarantined' ... if the ENTIRE DRIVE has been scanned, and literally there
+      are no more fast files/regions, then we give up, and just ride R slots until it finishes."</li>
+  <li>"As long as S &gt; R, then R slots are reserved for slow files/regions/whatever."</li>
+  <li>"Pathologically, if NCQ = R, then we manually set R' = (R - 4), and use R' as the new R, saving 4 slots for fast
+      reads."</li>
+  <li>On starting the backoff at R: "I disagree that we get nothing. It means that macOS/kernel delivers the next
+      command&mdash;which is faster than you doing it&mdash;UNTIL we find a faster one. Once we find faster ones, then we start
+      the quarantine process. Until then, having more slow readers also doesn't hurt."</li>
+  <li>On looking inside big files for fresh stretches: "Do a BFS style descent over regions, then."</li>
+  <li>Q's degraded drive is a SATA SSD in a Thunderbolt&nbsp;4 enclosure.</li>
+</ul>
+
+<h2>2. What was built</h2>
+<table>
+  <tr><th>Piece</th><th>Where</th><th>What it does</th></tr>
+  <tr><td>Regions</td><td><code>internal/copier/engine.go</code> (<code>region</code>, <code>startFile</code>, <code>breadthFirst</code>)</td>
+      <td>A file's remaining bytes are cut into 32&nbsp;MiB regions (<code>RegionSize</code>). Each keeps its own state:
+      unknown until a read of it finishes, fresh while its reads take under 50&nbsp;ms, slow (quarantined) while one is stuck
+      or its last one was slow. A region turns fresh again if its reads come back fast. Each region gets a rank in its file's
+      breadth-first descent: start, middle, quarters, eighths.</td></tr>
+  <tr><td>Lanes</td><td><code>pick</code>, <code>nextTry</code>, <code>take</code></td>
+      <td>Every read goes out in a lane: <i>slow</i> (counted as stuck from the start), <i>flying</i> (a fresh region), or
+      <i>try</i> (the first read of an unknown region). In-flight counts are kept per lane. Section 3.1 has the rules.</td></tr>
+  <tr><td>Pending tries</td><td><code>Engine.pending</code></td>
+      <td>Tries that have neither come back nor gone stuck: they might be fresh, so slow reads don't fill the queue while
+      any is out (3.2).</td></tr>
+  <tr><td>Queue measured</td><td><code>internal/copier/calibrate.go</code></td>
+      <td>Before copying, the dispatcher takes files from the walk and reads 4&nbsp;KiB of each until one comes back fast, then
+      reads scattered 4&nbsp;KiB pieces of it at 1, 2, 4, 8, 12, 16, 24, 32, 48 and 64 at once, 150&nbsp;ms each; Q is the
+      smallest count reaching 95% of the best rate. No fresh data in 5&nbsp;s: Q is 32.</td></tr>
+  <tr><td>Slow-lane tuner</td><td><code>slowTunerConfig</code>, <code>control</code></td>
+      <td>R uses the same tuner as W (steps of 4, 5% bar), judged on the slow lane's reads, with 3&nbsp;s and 20 reads per
+      measurement, 60&nbsp;s between checks, and a ceiling of Q&nbsp;&minus;&nbsp;4. It runs only while R is in force: fresh
+      and slow work both waiting.</td></tr>
+  <tr><td>Tuner</td><td><code>internal/tuner/tuner.go</code></td>
+      <td><code>SetMax</code>, so the ceilings can follow the measured queue.</td></tr>
+  <tr><td>Flags</td><td><code>cmd/qclone/main.go</code></td>
+      <td><code>--slow-lane N</code> (fixes R; 0: no slow lane), <code>--queue N</code> (fixes Q), <code>--no-lanes</code>
+      (rclone's way: <code>--readers</code> files at once, one read each, in order). <code>--max-stuck</code> is gone (never
+      released). <code>--fixed</code> freezes W and R.</td></tr>
+  <tr><td>Display</td><td><code>internal/ui/render.go</code>, <code>tui.go</code></td>
+      <td>Three lines where TUNER was: READS (in flight by lane, stuck count, quarantined regions, the queue and how it was
+      found), FLYING (W's tuner), SLOW (R's tuner, or why there's no slow lane). The chart's strip shows reads actually in
+      flight. The summary names W, R, the queue and the most stuck at once.</td></tr>
+  <tr><td>Tests</td><td><code>internal/copier/lanes_test.go</code> (was <code>stuck_test.go</code>)</td>
+      <td>Section 5.</td></tr>
+  <tr><td>Makefile, README</td><td></td>
+      <td><code>demo-fixed</code> uses <code>--no-lanes</code>; <code>tuner-diag</code> reports both tuners and the queue.
+      README's section is now "Fresh data flows while old data grinds".</td></tr>
+</table>
+
+<h2>3. Choices made, and why</h2>
+
+<h3>3.1 What a free reader does (<code>pick</code>)</h3>
+<ol>
+  <li><b>The slow lane:</b> while fewer than R slow reads are out, a slow region's next chunk. These R slots stay with slow
+      regions whenever they have work, however many failed tries are stuck elsewhere (Q's "as long as S &gt; R").</li>
+  <li><b>Flying reads:</b> while fewer than W are out, a fresh region's next chunk. While fresh work waits, nothing else goes
+      out ahead of it. That is the quarantine: slow reads beyond R aren't replaced as they finish, so they back off to R and
+      their slots go to fresh reads. Nothing is ever canceled.</li>
+  <li><b>Tries,</b> only when there's no fresh work: the untried region of lowest rank across open files (every open file's
+      start, then a new file's, then the next level down: middles, quarters, ...). One try per region at a time. New files
+      open while fewer than 2Q files are open.</li>
+  <li><b>More slow reads</b> in every slot left, only while nothing fresh is known, nothing is flying, and no try is pending.
+      This is Q's "until we find a faster one, more slow readers doesn't hurt": the next command is already queued at the
+      drive.</li>
+</ol>
+
+<h3>3.2 Pending tries (found by a test)</h3>
+<p>A first version filled the queue with slow reads whenever no region was known fresh. In
+<code>TestFreshFilesGoByTheSlowLane</code> that fired in the instant the fresh files' first reads were out but not yet back: the
+slow file jumped to 15 reads, then took 200&nbsp;ms to drain. Now a try counts as pending until it comes back or goes stuck, and
+rule 4 waits for no pending tries. The test passed five runs in a row afterwards, and asserts the slow lane holds at 4 (plus
+the try that found the file slow) while fresh work remains.</p>
+
+<h3>3.3 The ceilings</h3>
+<ul>
+  <li><b>Q</b> caps everything in flight. The gate admits Q workers; the pool has 256.</li>
+  <li><b>R &le; Q &minus; 4</b>, Q's rule for the pathological case, applied always: at least 4 slots are left for fresh reads.
+      A queue of 4 or less has no slow lane; slow regions are then read only when nothing fresh is left (rule 4).</li>
+  <li><b>W &le; Q.</b> No other ceiling; the tuner stops where more stops paying.</li>
+  <li><b>Open files &lt; 2Q</b>: tries in a folder of old files would otherwise open file after file, each left half-done.</li>
+</ul>
+
+<h3>3.4 Why measure Q this way</h3>
+<p>The number that matters is how many commands the whole path really works on at once: macOS, the enclosure's bridge, the
+link and the drive. A reported queue length can't show a bridge that takes fewer or passes commands on one at a time; a
+measurement covers every layer. Small reads show it best: SATA SSD spec sheets typically list around 10k random 4&nbsp;KiB reads
+a second with 1 in flight and 90&ndash;100k with 32, so the rate climbs to the real limit and stops. 256&nbsp;KiB chunks would
+saturate the link long before the queue. Calibration runs before any copying, so nothing else is in flight; it reads at most
+64&nbsp;MiB of the chosen file, scattered, so the drive's own cache can't flatter it.</p>
+
+<h3>3.5 Regions, not a look-ahead</h3>
+<p>The look-ahead inside quarantined big files that was discussed became regions: every 32&nbsp;MiB is judged on its own, and
+tries descend breadth first. A big file with an old stretch and fresh ones gets the fresh ones read in the flying slots while
+the old one grinds in the slow lane (<code>TestRegionsAreJudgedApart</code>).</p>
+
+<h2>4. Where the build departs from the request</h2>
+<ul>
+  <li><b>The end rides the full queue, not R.</b> Q first said "ride R slots until it finishes", then that more slow readers
+      don't hurt until something fresh turns up. With nothing fresh left, rule 4 fills the queue.</li>
+  <li><b>The reported queue length isn't read.</b> Only the measurement is used. The IOKit property name for a drive behind a
+      Thunderbolt enclosure is unknown; the <code>ioreg</code> check handed to Q (filtered for queue-related properties) hasn't
+      been run yet.</li>
+  <li><b>Regions</b> stand in for the look-ahead (3.5), and tries are breadth first across files as well as within them.</li>
+</ul>
+
+<h2>5. What was verified, and how</h2>
+<ul>
+  <li><b><code>make test</code></b>: <code>go vet</code>, then 60 tests with the race detector, all passing (the diagnostic is
+      skipped by design). New:
+    <ul>
+      <li><code>TestFreshFilesGoByTheSlowLane</code>: a slow file (200&nbsp;ms reads, served in parallel) and 16 fresh files
+          (10&nbsp;ms reads); W 4, R 4, Q 16. While fresh work remained, the slow file had at most 5 reads at once (its lane of 4
+          plus the try); all 64 fresh chunks were done before it was half done; afterwards it filled the queue (16 at once).</li>
+      <li><code>TestSlowBacksOffWhenFreshTurnsUp</code>: 20 old files, then 16 fresh ones the walk reaches later; Q 8, R 4.
+          Before anything fresh, reads in flight reached 8 and never more; from 250&nbsp;ms after the first fresh read until the
+          fresh work ran out (about 400&nbsp;ms), slow reads stayed at 4 or fewer.</li>
+      <li><code>TestRegionsAreJudgedApart</code>: one file of 8 regions, 2 of them old; all 24 fresh chunks were done before
+          the old regions were half read.</li>
+      <li><code>TestNoLanesReadsLikeRclone</code>: one read per file, at most 4 in all.</li>
+      <li><code>TestBreadthFirst</code>: the descent order, and every index exactly once for 0 to 199.</li>
+      <li><code>TestQueueMeasured</code>: a stand-in drive that serves 8 reads at a time measures as 8.
+          <code>TestQueueNotMeasuredWithoutFreshData</code>: all-slow data leaves Q at 32.</li>
+    </ul></li>
+  <li><b>The built binary on the demo tree</b> (972&nbsp;MB, 362 files, <code>--simulate degraded --plain</code>): 48&nbsp;s, no
+      errors, <code>diff -r</code> finds no difference.</li>
+  <li><b><code>make tuner-diag</code></b>:
+    <table>
+      <tr><th>Run</th><th>Time</th><th>Queue</th><th>On average in flight</th><th>Most stuck</th></tr>
+      <tr><td>hash order</td><td>48&nbsp;s</td><td>16, measured</td><td>14.0 slow, 1.0 trying, 0.1 flying</td><td>16</td></tr>
+      <tr><td>dfs order</td><td>48&nbsp;s</td><td>24, measured</td><td>21.8 slow, 1.2 trying</td><td>24</td></tr>
+      <tr><td><code>--no-lanes</code> (4 files, one 1&nbsp;MiB read each)</td><td>258&nbsp;s</td><td>4, set</td><td>2.3 flying</td><td>4</td></tr>
+    </table>
+    Stuck reads never exceeded the queue. v3 took 46&nbsp;s; the 2&nbsp;s difference is mostly calibration. Neither tuner moved:
+    on this simulator nothing stays fresh (7.1), so W has nothing to measure and R is never in force. <code>--no-lanes</code>
+    is v2's comparison shape (one read per file); v3's diagnostic used a looser one (4 reads anywhere, 151&nbsp;s), so the two
+    times aren't comparable.</li>
+</ul>
+
+<h2>6. Concerns and open issues</h2>
+
+<h3>6.1 The simulator still can't show lanes helping</h3>
+<p>Its single shared queue makes every fresh read wait behind slow ones, so almost everything counts as stuck, and fresh
+regions rarely stay fresh. The engine tests show the lanes with stand-in timings; the real drive, or a simulator variant with
+separate slow and fresh resources, is still needed to show them on a drive model.</p>
+
+<h3>6.2 R is measured only in mixed stretches</h3>
+<p>R is tuned only while fresh and slow work are both waiting, and its measurements need about 3&nbsp;s and 20 slow reads each.
+Mixed stretches shorter than that leave R at 4. On the simulator it never moved.</p>
+
+<h3>6.3 The queue measurement varies</h3>
+<p>The two diagnostic runs measured 16 and 24 on the same simulated drive: past its real limit (about 14 there), rates at
+higher counts sit near the 95% line, and noise decides. A margin either way changes little, since slots past the real limit
+just wait. It's measured once, at the start, on the first fresh file found within 5&nbsp;s.</p>
+
+<h3>6.4 The region size matches the simulator's</h3>
+<p>qclone's regions and the simulator's old/fresh regions are both 32&nbsp;MiB, which flatters region detection in simulation.
+On a real drive, ages don't follow 32&nbsp;MiB boundaries; a region that straddles one turns slow at its first old chunk and
+fresh again when reads come back fast.</p>
+
+<h3>6.5 Not yet done</h3>
+<ul>
+  <li>No run on the real drive (SATA SSD, Thunderbolt&nbsp;4 enclosure). It will show the measured queue, whether R climbs,
+      and whether fresh regions stay fresh beside slow reads.</li>
+  <li>The <code>ioreg</code> check of what macOS reports for the enclosure.</li>
+  <li>No 0.2.0 release.</li>
+</ul>
+
+<h2>7. Assets</h2>
+<ul>
+  <li><code>docs/built/qclone-v3-built.html</code>: the previous revision's as-built.</li>
+</ul>
+
+</body>
+</html>
