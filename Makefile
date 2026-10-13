@@ -19,7 +19,7 @@ LOG    := $(shell sed -n 's/^log=//p' $(ROOT)/.treeflow/project-type)
 LOGGED  = $(LOG) -n $@ --
 DEMO   := build/demo
 .DEFAULT_GOAL := help
-.PHONY: help build test demo demo-fixed demo-rescue install
+.PHONY: help build test demo demo-fixed demo-rescue install license-probe
 
 help:
 	@grep -E '^## ' $(firstword $(MAKEFILE_LIST)) | sed 's/^## /  /'
@@ -53,3 +53,8 @@ demo-rescue:
 ## install: build, then copy qclone to ~/bin/qclone
 install:
 	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/qclone ./cmd/qclone && install -m 755 build/qclone ~/bin/qclone && echo installed ~/bin/qclone'
+
+## license-probe: which licenses Homebrew's tools use (all, and Go-built), qclone's third-party
+##   Go modules, and each candidate license's length; writes probe/licenses/out/ (network)
+license-probe:
+	@cd $(ROOT) && $(LOGGED) python3 -I probe/licenses/probe.py

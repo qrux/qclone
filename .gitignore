@@ -8,3 +8,6 @@
 /*-qclone-errors.txt
 
 .DS_Store
+
+# Probe output (make license-probe).
+/probe/**/out/
