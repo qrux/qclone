@@ -17,14 +17,16 @@ ROOT  := $(patsubst %/,%,$(dir $(abspath $(firstword $(MAKEFILE_LIST)))))
 export PATH := /opt/homebrew/bin:$(HOME)/bin:$(PATH)
 LOG    := $(shell sed -n 's/^log=//p' $(ROOT)/.treeflow/project-type)
 LOGGED  = $(LOG) -n $@ --
+# Stricter, for output that may carry paths under ~ (Homebrew's cache): redacts them.
+CLEANLOGGED = cleanlog -n $@ --
 DEMO   := build/demo
 # -trimpath and -s -w keep this machine's paths (and so the home folder's name)
 # out of the binaries: no source paths, no symbol or debug tables.
 # The version is the latest tag (v0.1.0 -> 0.1.0), or the commit when there is none.
-VERSION := $(shell git -C $(ROOT) describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
-GOBUILD = go build -trimpath -ldflags "-s -w -X main.version=$(or $(VERSION),dev)"
+BUILD_VERSION := $(shell git -C $(ROOT) describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
+GOBUILD = go build -trimpath -ldflags "-s -w -X main.version=$(or $(BUILD_VERSION),dev)"
 .DEFAULT_GOAL := help
-.PHONY: help build test demo demo-fixed demo-rescue install license-probe
+.PHONY: help build test demo demo-fixed demo-rescue install license-probe release brew-check
 
 help:
 	@grep -E '^## ' $(firstword $(MAKEFILE_LIST)) | sed 's/^## /  /'
@@ -63,3 +65,18 @@ install:
 ##   Go modules, and each candidate license's length; writes probe/licenses/out/ (network)
 license-probe:
 	@cd $(ROOT) && $(LOGGED) python3 -I probe/licenses/probe.py
+
+## release VERSION=x.y.z [DRY_RUN=1]: publish a version through the Homebrew tap. A new
+##   version: checks main is clean and pushed, runs vet and the tests, tags vx.y.z and pushes
+##   the tag. Then (new or existing tag) builds GitHub's tarball the formula's way, writes
+##   Formula/qclone.rb with its checksum into the tap (<owner>/homebrew-tap, cloned into
+##   build/) and pushes it. DRY_RUN=1 does everything but the pushes. packaging/homebrew/
+release:
+	@cd $(ROOT) && $(LOGGED) packaging/homebrew/release.sh "$(VERSION)"
+
+## brew-check: install qclone from the published tap exactly as a user would (taps it,
+##   runs brew audit, builds it from source, runs the formula's test). Installs qclone
+##   into Homebrew. Logged by cleanlog: Homebrew prints paths under ~, which it redacts.
+brew-check:
+	@cd $(ROOT) && owner=$$(git remote get-url origin | sed -E 's#^git@[^:]+:([^/]+)/.*#\1#') && \
+	$(CLEANLOGGED) sh -c "brew tap $$owner/tap && brew audit --strict --online $$owner/tap/qclone && brew install --build-from-source $$owner/tap/qclone && brew test $$owner/tap/qclone && qclone --version"

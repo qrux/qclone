@@ -170,6 +170,16 @@ Flags may go anywhere on the line, as with rclone. Ctrl-C stops cleanly: reads
 already in flight finish, and partial files are removed. A second Ctrl-C quits
 at once.
 
+## Installing
+
+```
+brew install qrux/tap/qclone
+```
+
+Homebrew builds it from the release's source on your Mac (it needs Go only to
+build). Releases are published with `make release VERSION=x.y.z`; see
+`packaging/homebrew/`.
+
 ## Building and trying it
 
 ```
@@ -179,6 +189,8 @@ make demo        # ~1 GB copy on a simulated degraded SSD, to watch the tuner wo
 make demo-fixed  # the same copy at a fixed 4 readers x 1M, for comparison
 make demo-rescue # a failing drive: a plain pass, then a --rescue pass
 make install     # copy qclone to ~/bin
+make release VERSION=x.y.z   # tag, and publish the formula to the Homebrew tap
+make brew-check  # install from the tap exactly as a user would
 ```
 
 The simulated drive (`--simulate degraded`) treats any path component starting
