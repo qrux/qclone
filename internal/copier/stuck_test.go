@@ -55,10 +55,10 @@ func (c *concurrency) fault(isSlow func(string) bool, slowFor, fastFor time.Dura
 
 // One big file sits in an old region: each read takes 200 ms, and the drive
 // can serve many at once. Sixteen fresh files read in a millisecond. With room
-// for 16 stuck reads, the slow file fills that room while the 4 flying reads
-// finish the fresh files. With none, the fresh files still go first (the slow
-// file is found out after one read), but then the slow file gets only the 4
-// flying reads.
+// for 16 stuck reads, the slow file fills that room, and never more, while the
+// 4 flying reads finish the fresh files. With none, the fresh files still go
+// first (the slow file is found out after one read), but then the slow file
+// gets only the 4 flying reads.
 func TestSlowFileGetsTheStuckRoom(t *testing.T) {
 	base := t.TempDir()
 	src := filepath.Join(base, "s")
@@ -82,8 +82,8 @@ func TestSlowFileGetsTheStuckRoom(t *testing.T) {
 	room, none := try(16), try(0)
 	t.Logf("room for 16 stuck: slow file up to %d reads at once, %d in all, %d of 64 fresh chunks done when the slow file was half done", room.slowMax, room.allMax, room.fastAt[24])
 	t.Logf("no room: slow file up to %d reads at once, %d in all", none.slowMax, none.allMax)
-	if room.slowMax < 12 {
-		t.Errorf("with room for 16 stuck, the slow file had at most %d reads in flight", room.slowMax)
+	if room.slowMax < 12 || room.slowMax > 16 {
+		t.Errorf("with room for 16 stuck, the slow file had up to %d reads in flight; want the room filled, and no more", room.slowMax)
 	}
 	if room.allMax > 20 {
 		t.Errorf("%d reads in flight; 4 flying + 16 stuck is the most", room.allMax)
@@ -96,9 +96,10 @@ func TestSlowFileGetsTheStuckRoom(t *testing.T) {
 	}
 }
 
-// When every read is slow, reads in flight grow past the 4 flying ones to make
-// room for 16 stuck ones, and no further.
-func TestEverythingStuckStaysWithinTheRoom(t *testing.T) {
+// When every read is slow, reads in flight settle at the 16 stuck ones: the
+// flying readers (8 here, as if the tuner had climbed in fresh data) wait for
+// fresh work instead of piling more onto the slow files.
+func TestStuckReadsStopAtTheCap(t *testing.T) {
 	base := t.TempDir()
 	src := filepath.Join(base, "s")
 	var specs []spec
@@ -107,7 +108,7 @@ func TestEverythingStuckStaysWithinTheRoom(t *testing.T) {
 	}
 	makeTree(t, src, specs)
 	c := &concurrency{}
-	o := fixed(filepath.Join(base, "e.txt"), 4, 16, plan.OrderDFS)
+	o := fixed(filepath.Join(base, "e.txt"), 8, 16, plan.OrderDFS)
 	o.Chunk = 64 << 10
 	dst := filepath.Join(base, "d")
 	e := runWith(t, []string{src + "/", dst}, o, c.fault(func(string) bool { return true }, 100*time.Millisecond, 0))
@@ -117,8 +118,11 @@ func TestEverythingStuckStaysWithinTheRoom(t *testing.T) {
 	}
 	sameTree(t, src, dst)
 	t.Logf("%d reads in flight at most; %d counted stuck at once", c.allMax, s.PeakStuck)
-	if c.allMax < 17 || c.allMax > 20 {
-		t.Errorf("%d reads in flight at most; want more than the 4 flying and no more than 4 + 16", c.allMax)
+	if c.allMax < 14 || c.allMax > 16 {
+		t.Errorf("%d reads in flight at most; want the 16 stuck reads' room filled, and no more", c.allMax)
+	}
+	if s.PeakStuck > 16 {
+		t.Errorf("%d reads counted stuck at once; the cap is 16", s.PeakStuck)
 	}
 	if s.Stuck != 0 {
 		t.Errorf("%d reads still counted stuck after the run", s.Stuck)

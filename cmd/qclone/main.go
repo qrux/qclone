@@ -34,11 +34,15 @@ Files already at DST with the same size and modification time are skipped.
 
 flags:
   -j, --readers N      flying reads at the start (default 4): reads not stuck on
-                       slow data. Doubled while that makes them faster
-      --max-readers N  most flying reads (default 32)
-      --max-stuck N    a read in flight over 50 ms is stuck, and gets room of
-                       its own beside the flying reads, up to N stuck reads
-                       (default 16); 0: stuck reads use up flying ones
+                       slow data. Raised 4 at a time while that makes them
+                       faster
+      --max-readers N  most flying reads, if you want a limit (default: none;
+                       they're raised only while that pays; 256 at most)
+      --max-stuck N    a read in flight over 50 ms is stuck. Stuck reads get
+                       room of their own beside the flying reads, up to N of
+                       them, and no more are sent to slow files past that
+                       (default 16); 0: no room of their own, they take
+                       flying reads' places, as in rclone
       --chunk SIZE     bytes per read, e.g. 256K, 4M (default 256K)
       --order ORDER    hash (default): by a hash of each path, among the next 1,024
                        files found, to mix old and new data; dfs: depth first,
@@ -127,7 +131,7 @@ func run(args []string) (code int) {
 	var readers int
 	fs.IntVar(&readers, "readers", 4, "")
 	fs.IntVar(&readers, "j", 4, "")
-	maxReaders := fs.Int("max-readers", 32, "")
+	maxReaders := fs.Int("max-readers", 256, "")
 	maxStuck := fs.Int("max-stuck", 16, "")
 	orderFlag := fs.String("order", "hash", "")
 	chunkFlag := fs.String("chunk", "", "")

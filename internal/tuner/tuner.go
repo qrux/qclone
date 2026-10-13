@@ -8,20 +8,22 @@
 //
 //	reads in flight = flying + min(stuck, max stuck)
 //
-// so stuck reads never use up the flying ones' room, and once max stuck are
-// stuck nothing more is opened for them. This package sets only the flying
-// number.
+// so stuck reads never use up the flying ones' room, and stuck reads are what's
+// capped: once max stuck are stuck, nothing more goes to slow files. This
+// package sets only the flying number, which has no fixed cap.
 //
 // It is judged on flying reads alone. Those all read fresh data at about the
 // same speed, so their throughput over a second is a steady number, and a plain
 // before-and-after comparison works: no read that got stuck counts, so which
 // slow files happen to be open doesn't matter. The rule:
 //
-//   - At the start, double the flying reads while each doubling makes them at
-//     least 5% faster. When one doesn't, go back.
-//   - Then every 30 s, try one step up (double) and one step down (half), each
+//   - At the start, add 4 flying reads at a time while each step makes them at
+//     least 5% faster. When one doesn't, go back. Small steps stop close to
+//     where more stops paying; doubling could overshoot by as many again, and
+//     every flying read too many is one more read that can get stuck.
+//   - Then every 30 s, try one step up (+4) and one step down (-4), each
 //     against a fresh measurement of the current number, and move only to one
-//     that is at least 5% faster. A step up that pays starts the doubling again.
+//     that is at least 5% faster. A step up that pays starts the climb again.
 //   - A measurement lasts at least 1 s and 20 flying reads. If 5 s pass without
 //     20, there's too little flying to judge, and the number holds.
 //   - While the readers can't be kept busy (the walk is behind, or the copy is
@@ -36,6 +38,7 @@ import (
 // Config bounds the tuner. Times are durations since the run started.
 type Config struct {
 	MinReaders, MaxReaders int           // the range of flying reads
+	Step                   int           // flying reads added or taken away per test
 	Warmup                 time.Duration // before the first measurement
 	Window                 time.Duration // shortest measurement
 	MaxWindow              time.Duration // longest; too few flying reads by then and the test is off
@@ -47,8 +50,12 @@ type Config struct {
 
 // DefaultConfig is what qclone uses.
 func DefaultConfig() Config {
+	// No fixed ceiling on flying reads: they're raised only while a step pays,
+	// which on a SATA drive stops well short of its 32 command slots. (With
+	// steps of 4 and a 5% bar, even perfect scaling stops at 80: 4 more is under
+	// 5% past that.) 256 is a backstop, the most --max-readers allows.
 	return Config{
-		MinReaders: 1, MaxReaders: 32,
+		MinReaders: 1, MaxReaders: 256, Step: 4,
 		Warmup:    time.Second,
 		Window:    time.Second,
 		MaxWindow: 5 * time.Second,
@@ -115,7 +122,7 @@ type Tuner struct {
 	w         int           // flying reads now
 	appliedAt time.Duration // when w last changed
 	phase     phase
-	climbing  bool // doubling until a step stops paying
+	climbing  bool // stepping up until a step stops paying
 	base      int  // the incumbent during a check
 	baseRate  float64
 	plan      []int // candidates left in this check
@@ -140,6 +147,9 @@ func New(cfg Config, start int, fixed bool) *Tuner {
 	}
 	if cfg.MaxReaders < cfg.MinReaders {
 		cfg.MaxReaders = cfg.MinReaders
+	}
+	if cfg.Step < 1 {
+		cfg.Step = 4
 	}
 	return &Tuner{cfg: cfg, fixed: fixed, w: clamp(start, cfg.MinReaders, cfg.MaxReaders), climbing: true, from: -1}
 }
@@ -219,11 +229,11 @@ func (t *Tuner) cand() int {
 func (t *Tuner) check(now time.Duration) {
 	t.base = t.w
 	t.plan = t.plan[:0]
-	if up := clamp(t.w*2, t.cfg.MinReaders, t.cfg.MaxReaders); up != t.w {
+	if up := clamp(t.w+t.cfg.Step, t.cfg.MinReaders, t.cfg.MaxReaders); up != t.w {
 		t.plan = append(t.plan, up)
 	}
 	if !t.climbing {
-		if down := clamp(t.w/2, t.cfg.MinReaders, t.cfg.MaxReaders); down != t.w {
+		if down := clamp(t.w-t.cfg.Step, t.cfg.MinReaders, t.cfg.MaxReaders); down != t.w {
 			t.plan = append(t.plan, down)
 		}
 	}
@@ -274,11 +284,11 @@ func (t *Tuner) measure(now time.Duration) {
 		t.decide(now, cand, gain, true, "kept")
 		t.changes++
 		if cand > t.base {
-			// Up paid: keep doubling from here, against what was just measured.
+			// Up paid: keep climbing from here, against what was just measured.
 			t.climbing = true
 			t.base, t.baseRate = cand, rate
 			t.plan = t.plan[:0]
-			if up := clamp(cand*2, t.cfg.MinReaders, t.cfg.MaxReaders); up != cand {
+			if up := clamp(cand+t.cfg.Step, t.cfg.MinReaders, t.cfg.MaxReaders); up != cand {
 				t.plan = append(t.plan, up)
 			}
 			t.next(now)

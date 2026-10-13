@@ -100,9 +100,10 @@ of milliseconds, or seconds. Every other read is **flying**. qclone keeps
 reads in flight = flying + min(stuck, 16)
 ```
 
-so stuck reads never use up the flying ones' room, and once 16 are stuck
-(`--max-stuck`), nothing more is opened for them. A reader that comes free
-goes, in this order:
+so stuck reads never use up the flying ones' room. Stuck reads are what's
+capped: once 16 are stuck (`--max-stuck`), nothing more goes to slow files.
+Flying reads have no fixed cap; the tuner adds them only while they pay. A
+reader that comes free goes, in this order:
 
 1. While fewer than 16 reads are stuck, to a slow file's next chunk. A file is
    slow while it has a stuck read, or if its last read was slow. Reads sent to
@@ -112,9 +113,11 @@ goes, in this order:
    finished yet gets one read at a time, so finding out that a new file is
    slow costs one read, not all of them. When no open file has a chunk to
    give, the next file is opened.
-3. Otherwise, to a slow file, so no reader sits idle while there's work. When
-   everything is slow, that makes flying + 16 reads in flight, all of them
-   stuck.
+
+Otherwise it waits for fresh work. So when everything is slow, reads in flight
+settle at 16, all stuck, and the flying readers wait for fresh data. With
+`--max-stuck 0`, slow files take flying readers' places instead, as every read
+does in rclone.
 
 Files go in hash order by default: of the next 1,024 files the walk has found,
 the one whose path hashes lowest goes next. Data written together usually sits
@@ -124,10 +127,12 @@ first with names sorted; `--order dirent` copies depth first as the disk lists
 them.
 
 The number of flying reads tunes itself. It starts at 4 (`--readers`) and
-doubles while each doubling makes the flying reads at least 5% faster; when one
-doesn't, it goes back. Every 30 seconds it tries one step up and one step down,
-each against a fresh measurement of the current number, and moves only to one
-that is at least 5% faster. A measurement lasts at least a second and 20
+adds 4 at a time while each step makes the flying reads at least 5% faster;
+when one doesn't, it goes back. Small steps stop close to where more reads stop
+paying, and every flying read too many is one more read that can get stuck
+when old data turns up. Every 30 seconds it tries 4 more and 4 fewer, each
+against a fresh measurement of the current number, and moves only to one that
+is at least 5% faster. A measurement lasts at least a second and 20
 flying reads. Only flying reads are measured. They all read fresh data at
 about the same speed, so a plain before-and-after comparison holds. Throughput
 counting every read would mostly measure which slow files happened to be open.
@@ -160,11 +165,13 @@ and paths are never written to stdout, so a log of a run holds none.
 ## Flags
 
 ```
--j, --readers N      flying reads at the start (default 4); doubled while that
-                     makes them faster
-    --max-readers N  most flying reads (default 32)
-    --max-stuck N    room for reads stuck over 50 ms, beside the flying ones
-                     (default 16); 0: stuck reads use up flying ones
+-j, --readers N      flying reads at the start (default 4); raised 4 at a time
+                     while that makes them faster
+    --max-readers N  most flying reads, if you want a limit (default: none;
+                     they're raised only while that pays; 256 at most)
+    --max-stuck N    the most reads stuck over 50 ms, in room of their own
+                     beside the flying ones (default 16); 0: no room of their
+                     own, they take flying reads' places, as in rclone
     --chunk SIZE     bytes per read, e.g. 256K, 4M (default 256K)
     --order ORDER    hash (default), dfs or dirent: the order files go in
     --fixed          don't tune: keep --readers as given

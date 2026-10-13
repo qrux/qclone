@@ -15,9 +15,9 @@
 //	reads in flight = flying + min(stuck, MaxStuck)
 //
 // where the tuner sets flying, so stuck reads never use up the flying ones'
-// room, and once MaxStuck are stuck nothing more is opened for them. The
-// dispatcher keeps slow files going in the stuck reads' room and the flying
-// reads on files with nothing stuck (pick).
+// room. Stuck reads are capped instead: once MaxStuck are stuck, nothing more
+// goes to slow files. The dispatcher keeps slow files going in the stuck reads'
+// room and the flying reads on files with nothing stuck (pick).
 package copier
 
 import (
@@ -47,8 +47,8 @@ import (
 // Options configure a run.
 type Options struct {
 	Readers      int           // flying reads at the start
-	Tuner        tuner.Config  // Tuner.MaxReaders is the most flying reads
-	MaxStuck     int           // stuck reads that get room of their own; 0: none
+	Tuner        tuner.Config  // Tuner.MaxReaders: a backstop on flying reads; the tuner stops adding them when they stop paying
+	MaxStuck     int           // the most stuck reads, in room of their own; 0: none, they take flying slots
 	StuckAfter   time.Duration // a read in flight this long is stuck (0: 50 ms)
 	Chunk        int           // bytes per read (0: 256 KiB)
 	Fixed        bool          // never change the number of flying reads
@@ -733,9 +733,12 @@ func (e *Engine) dispatch(ctx context.Context) {
 //     slow costs one read, not all of them. If no open file has a chunk to
 //     give, the next file is opened, while fewer than flying + MaxStuck files
 //     are open.
-//  3. Otherwise a slow file's chunk, counted as stuck, so no reader idles
-//     while there's work. In a stretch where everything is slow, that makes
-//     flying + MaxStuck reads in flight, all stuck.
+//
+// Otherwise the reader waits for fresh work: once MaxStuck reads are stuck,
+// nothing more goes to slow files, so a stretch where everything is slow
+// settles at MaxStuck reads in flight. With MaxStuck 0 there is no room of
+// their own, and slow files take flying slots instead, as all reads do in
+// rclone.
 func (e *Engine) pick(open *[]*openFile, walkDone *bool) (job, bool) {
 	if int(e.stuck.Load()) < e.opt.MaxStuck {
 		if o := e.choose(*open, slowFile); o != nil {
@@ -754,8 +757,10 @@ func (e *Engine) pick(open *[]*openFile, walkDone *bool) (job, bool) {
 		}
 		*walkDone = done
 	}
-	if o := e.choose(*open, slowFile); o != nil {
-		return e.take(open, o, true), true
+	if e.opt.MaxStuck == 0 {
+		if o := e.choose(*open, slowFile); o != nil {
+			return e.take(open, o, true), true
+		}
 	}
 	return job{}, false
 }

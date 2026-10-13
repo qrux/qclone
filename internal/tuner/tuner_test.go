@@ -54,7 +54,7 @@ func scales(_ time.Duration, w int) float64 {
 	return float64(w) * 20e6
 }
 
-func TestDoublesWhileItPays(t *testing.T) {
+func TestClimbsFourAtATimeWhileItPays(t *testing.T) {
 	l := newLane(4, false, scales)
 	l.run(15 * time.Second)
 	if l.w != 16 {
@@ -64,7 +64,7 @@ func TestDoublesWhileItPays(t *testing.T) {
 	want := []struct {
 		from, to int
 		kept     bool
-	}{{4, 8, true}, {8, 16, true}, {16, 32, false}}
+	}{{4, 8, true}, {8, 12, true}, {12, 16, true}, {16, 20, false}}
 	if len(h) != len(want) {
 		t.Fatalf("history %+v", h)
 	}
@@ -78,6 +78,20 @@ func TestDoublesWhileItPays(t *testing.T) {
 	}
 }
 
+// No ceiling at the SATA queue's 32: it goes as far as a step pays.
+func TestNoFixedCeiling(t *testing.T) {
+	l := newLane(4, false, func(_ time.Duration, w int) float64 {
+		if w > 40 {
+			w = 40
+		}
+		return float64(w) * 10e6
+	})
+	l.run(30 * time.Second)
+	if l.w != 40 {
+		t.Fatalf("flying reads %d, want 40 (36 -> 40 still pays; 44 doesn't); history %+v", l.w, l.history())
+	}
+}
+
 func TestStaysWhenMoreDoesNotHelp(t *testing.T) {
 	l := newLane(4, false, func(time.Duration, int) float64 { return 400e6 })
 	l.run(10 * time.Second)
@@ -87,8 +101,8 @@ func TestStaysWhenMoreDoesNotHelp(t *testing.T) {
 	}
 }
 
-// After the drive changes so that more than 8 flying reads hurt, the next
-// check tries up (worse), then down (better), and moves down.
+// After the drive changes so that more than 8 flying reads hurt, each check
+// tries up (worse), then down (better), and moves down, 4 at a time.
 func TestRechecksBothWays(t *testing.T) {
 	l := newLane(4, false, func(now time.Duration, w int) float64 {
 		if now < 20*time.Second {
@@ -103,21 +117,21 @@ func TestRechecksBothWays(t *testing.T) {
 	if l.w != 16 {
 		t.Fatalf("climbed to %d, want 16", l.w)
 	}
-	l.run(100 * time.Second)
+	l.run(140 * time.Second)
 	if l.w != 8 {
 		t.Fatalf("flying reads %d, want 8; history %+v", l.w, l.history())
 	}
-	var down bool
+	downs := 0
 	for _, d := range l.history() {
-		if d.From == 16 && d.To == 8 && d.Kept {
-			down = true
+		if (d.From == 16 && d.To == 12 || d.From == 12 && d.To == 8) && d.Kept {
+			downs++
 		}
 		if d.At > 20*time.Second && d.From == 8 && d.To == 16 && d.Kept {
 			t.Errorf("went back up: %+v", d)
 		}
 	}
-	if !down {
-		t.Errorf("never moved 16 -> 8: %+v", l.history())
+	if downs != 2 {
+		t.Errorf("didn't step down 16 -> 12 -> 8: %+v", l.history())
 	}
 }
 
