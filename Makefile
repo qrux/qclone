@@ -20,7 +20,9 @@ LOGGED  = $(LOG) -n $@ --
 DEMO   := build/demo
 # -trimpath and -s -w keep this machine's paths (and so the home folder's name)
 # out of the binaries: no source paths, no symbol or debug tables.
-GOBUILD = go build -trimpath -ldflags "-s -w"
+# The version is the latest tag (v0.1.0 -> 0.1.0), or the commit when there is none.
+VERSION := $(shell git -C $(ROOT) describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
+GOBUILD = go build -trimpath -ldflags "-s -w -X main.version=$(or $(VERSION),dev)"
 .DEFAULT_GOAL := help
 .PHONY: help build test demo demo-fixed demo-rescue install license-probe
 

@@ -46,6 +46,7 @@ flags:
       --simulate degraded|failing
                        pretend the source is a degraded SSD (for a demo or a
                        test); "failing" adds some sectors that can't be read
+      --version        print the version and exit
   -h, --help           this help
 
 An interrupted copy resumes: rerun the same command and each file carries on
@@ -59,6 +60,40 @@ arguments, 130 stopped.
 `
 
 func main() { os.Exit(run(os.Args[1:])) }
+
+// version is set at build time: -ldflags "-X main.version=0.1.0" (the
+// Makefile and the Homebrew formula both do). A plain go build leaves "dev".
+var version = "dev"
+
+// versionString is "qclone 0.1.0", or for an unreleased build "qclone dev
+// (545c42a)" with the commit it was built from, when Go recorded one.
+func versionString() string {
+	v := "qclone " + version
+	if version != "dev" {
+		return v
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		rev, dirty := "", false
+		for _, kv := range bi.Settings {
+			switch kv.Key {
+			case "vcs.revision":
+				rev = kv.Value
+			case "vcs.modified":
+				dirty = kv.Value == "true"
+			}
+		}
+		if len(rev) > 7 {
+			rev = rev[:7]
+		}
+		if rev != "" {
+			if dirty {
+				rev += ", modified"
+			}
+			v += " (" + rev + ")"
+		}
+	}
+	return v
+}
 
 func parseSize(s string) (int, error) {
 	t := strings.ToUpper(strings.TrimSpace(s))
@@ -94,6 +129,7 @@ func run(args []string) (code int) {
 	noColor := fs.Bool("no-color", false, "")
 	simulate := fs.String("simulate", "", "")
 	var help bool
+	showVersion := fs.Bool("version", false, "")
 	fs.BoolVar(&help, "help", false, "")
 	fs.BoolVar(&help, "h", false, "")
 
@@ -115,6 +151,10 @@ func run(args []string) (code int) {
 		}
 		pos = append(pos, rest[0])
 		rest = rest[1:]
+	}
+	if *showVersion {
+		fmt.Println(versionString())
+		return 0
 	}
 	if help {
 		fmt.Print(usage)
