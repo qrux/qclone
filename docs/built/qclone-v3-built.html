@@ -33,8 +33,9 @@ documented at <code>0d19ca2</code>). Everything in v1 and v2 still holds unless 
 no spec: the work followed Q's requests in chat on 2026-10-13.</p>
 
 <div class="note"><p><b>In one line:</b> the A C A C A tuner is gone. qclone now keeps
-<code>reads in flight = flying + min(stuck, 16)</code>, where a read is stuck after 50&nbsp;ms in flight, and tunes only the
-flying number, judged on reads that never got stuck. On the simulated drive the demo copy takes 46&nbsp;s in hash order
+<code>reads in flight = flying + min(stuck, 16)</code>, where a read is stuck after 50&nbsp;ms in flight. Stuck reads are
+capped at 16: past that, nothing more goes to slow files. Flying reads have no fixed cap; the tuner adds them 4 at a time only
+while that pays, judged on reads that never got stuck. On the simulated drive the demo copy takes 46&nbsp;s in hash order
 (v2: 141&nbsp;s; 0.1.0: 52&nbsp;s in dfs order).</p></div>
 
 <h2>1. What was asked</h2>
@@ -51,6 +52,14 @@ flying number, judged on reads that never got stuck. On the simulated drive the 
       in the stuck reads' room. Delete the tuner, files at once, the per-file cap and chunk tuning; chunks fixed at
       256&nbsp;KiB; the 16 becomes a flag. Done when <code>make test</code> passes, demo copies are byte-identical, and
       hash order on the simulated drive is about as fast as 0.1.0's 52&nbsp;s.</li>
+  <li>The first cut capped flying reads at 32 (v1's cap on all reads, from SATA's 32 command slots) and gave stuck reads
+      16 more on top, and when there was no fresh work the idle flying slots took slow work. So a slow stretch could hold
+      48 reads, all stuck. Q: "Inverted. No cap on flying reads... Since the tuner will tell us if the next new reader
+      gains us anything... What needs to get capped (especially in the SATA source case) is THE STUCK READERS." That is
+      what was built (sections 3.2 and 3.3). Q's degraded drive is in a Thunderbolt enclosure, which, as Q pointed out,
+      decides nothing in the design: the flying number is measured, and the stuck cap is a fixed flag.</li>
+  <li>The first cut also doubled the flying number. Q: "Doubling isn't always the right primitive. Just add 4 at a
+      time." Steps are now 4 up and 4 down (3.4).</li>
 </ul>
 
 <h2>2. What was built</h2>
@@ -66,15 +75,15 @@ flying number, judged on reads that never got stuck. On the simulated drive the 
       pool has <code>MaxReaders + MaxStuck</code> workers.</td></tr>
   <tr><td>Where a read goes</td><td><code>pick</code>, <code>slowFile</code>, <code>fastFile</code>, <code>choose</code>,
       <code>take</code></td>
-      <td>Three rules in order, at the moment a worker asks (section 3.2).</td></tr>
+      <td>Two rules in order, at the moment a worker asks; otherwise the worker waits (section 3.2).</td></tr>
   <tr><td>Pull dispatcher</td><td><code>dispatch</code>, <code>worker</code></td>
       <td>A worker through the gate sends its reply channel on <code>want</code>; the dispatcher picks the chunk then, not
       ahead of time, so every choice uses the current stuck counts. <code>quit</code> closes when nothing is left.</td></tr>
   <tr><td>Tuner</td><td><code>internal/tuner/tuner.go</code> (rewritten, about 380 lines, was 930)</td>
       <td>Sets only the number of flying reads, judged on flying reads alone (section 3.4).</td></tr>
   <tr><td>Flags</td><td><code>cmd/qclone/main.go</code></td>
-      <td>New <code>--max-stuck N</code> (default 16, 0 to 256). <code>--readers</code> and <code>--max-readers</code> now
-      mean flying reads. <code>--chunk</code> is a plain setting (default 256K). <code>--files</code> is gone (it was never
+      <td>New <code>--max-stuck N</code> (default 16, 0 to 256). <code>--readers</code> now means flying reads at the
+      start; <code>--max-readers</code> is an optional limit on them, off by default (256, its old maximum, is the backstop). <code>--chunk</code> is a plain setting (default 256K). <code>--files</code> is gone (it was never
       released). <code>--fixed</code> freezes only the flying number.</td></tr>
   <tr><td>Display</td><td><code>internal/ui/render.go</code>, <code>tui.go</code></td>
       <td>TUNER line: "4 reads x 256K" while nothing is stuck, else "2 flying + 16 stuck reads x 256K (stuck room full)",
@@ -115,17 +124,24 @@ flying number, judged on reads that never got stuck. On the simulated drive the 
   <li><b>A file with nothing stuck.</b> A file none of whose reads has finished yet gets one read at a time, so finding out
       that a new file is slow costs one flying read, not all of them. When no open file has a chunk to give, the next file
       is opened, while fewer than <code>flying + MaxStuck</code> files are open.</li>
-  <li><b>Otherwise a slow file's chunk</b>, counted as stuck, so no reader idles while there's work.</li>
 </ol>
-<p>Round-robin among the files each rule accepts. The per-file cap of v2 (readers &divide; files) is gone: rule 2 keeps
-flying reads off slow files, and a fast file may take every flying read.</p>
+<p>Otherwise the worker waits for fresh work. Round-robin among the files each rule accepts. The per-file cap of v2
+(readers &divide; files) is gone: rule 2 keeps flying reads off slow files, and a fast file may take every flying read.
+With <code>MaxStuck</code> 0 there is no room of their own, so slow files take flying slots instead, as every read does in
+rclone.</p>
 
-<h3>3.3 Bounds</h3>
+<h3>3.3 Caps</h3>
 <ul>
+  <li><b>Stuck reads: at most <code>MaxStuck</code></b> (16). Past that, nothing more goes to slow files. When everything is
+      slow, reads in flight settle at 16, all stuck, and the flying readers wait for fresh data. A read only shows it's
+      stuck after it was sent, so for a moment more can be stuck: flying reads that run into old data, or the first read of
+      a newly opened file. None of those is replaced while 16 or more are stuck.</li>
+  <li><b>Flying reads: no fixed cap.</b> The tuner adds them only while a step pays, and a drive whose queue is full
+      gains nothing from more, so it stops there by measurement. <code>--max-readers</code> is an optional limit; 256, the
+      most it ever allowed, is the backstop and the size of the worker pool's flying part.</li>
   <li><b>Open files: at most flying + <code>MaxStuck</code></b> (20 by default). Without it, the flying reads would keep
-      opening new files while slow ones piled up half-done, each holding two file descriptors and a part file.</li>
-  <li><b>When everything is slow,</b> rule 3 fills the flying slots too: <code>flying + MaxStuck</code> reads in flight, all
-      stuck (20 by default). This is the "worst case 20" discussed with Q. See 7.1 for when it can be larger.</li>
+      opening new files while slow ones piled up half-done, each holding two file descriptors and a part file. It also
+      limits how often a new file's first read can land on old data.</li>
 </ul>
 
 <h3>3.4 The tuner</h3>
@@ -136,11 +152,15 @@ flying reads off slow files, and a fast file may take every flying read.</p>
   <li><b>A measurement</b> lasts at least 1&nbsp;s and 20 flying reads. It counts ops that began after the last change and
       ended after the window opened (100&nbsp;ms after the change). If 5&nbsp;s pass without 20, the test is off ("too few
       flying reads") and the number holds for 10&nbsp;s.</li>
-  <li><b>Climbing</b>: double while each doubling is at least 5% faster than the number before it, measured just before.
-      When one isn't, go back and hold 30&nbsp;s.</li>
-  <li><b>Rechecks</b> every 30&nbsp;s: measure the current number, try double, then half, each against that measurement, and
-      move only to one at least 5% faster. Equal means stay, so it never wanders on noise (a test with 10% jitter per
-      20&nbsp;ms makes at most one change in three minutes). Up paying starts the doubling again.</li>
+  <li><b>Climbing</b>: add 4 while each step is at least 5% faster than the number before it, measured just before. When
+      one isn't, go back and hold 30&nbsp;s. Small steps stop within 4 of where more stops paying; doubling could overshoot by
+      as many again (a drive whose gains end at 10 would sit at 16), and every flying read too many is one more read that
+      can get stuck when old data turns up.</li>
+  <li><b>Rechecks</b> every 30&nbsp;s: measure the current number, try 4 more, then 4 fewer (not below 1), each against that
+      measurement, and move only to one at least 5% faster. Equal means stay, so it never wanders on noise (a test with 10%
+      jitter per 20&nbsp;ms makes at most one change in three minutes). Up paying starts the climb again.</li>
+  <li><b>An implicit ceiling</b>: with steps of 4 and a 5% bar, even perfect scaling stops at 80 flying reads, since 4 more
+      is under 5% past that.</li>
   <li><b>Starved</b>: workers waiting for work for 100&nbsp;ms, or less than 10&nbsp;s of work left. Then nothing is measured;
       a test in progress is called off and the number goes back.</li>
   <li><b>Removed</b>: the A C A C A rounds, the plausibility check, stretched arms, region memory, the two-generation settle,
@@ -151,33 +171,33 @@ flying reads off slow files, and a fast file may take every flying read.</p>
 <ul>
   <li><code>--fixed</code> freezes only the flying number; <code>--max-stuck 0</code> takes away the stuck reads' room.
       Together, with <code>--readers 4 --chunk 1M</code>, they're rclone's shape (<code>make demo-fixed</code>).</li>
-  <li><code>--max-readers</code> keeps its range (1 to 256) and default (32), now for flying reads. Total reads in flight
-      can reach <code>--max-readers</code> + <code>--max-stuck</code>.</li>
+  <li><code>--max-readers</code> keeps its range (1 to 256); its default is now none (256 in effect).</li>
 </ul>
 
 <h2>4. Where the build departs from the request</h2>
 <ul>
-  <li><b>Rule 3</b>: when there's no fast work, the flying slots take slow chunks rather than sit idle. So in a stretch where
-      everything is slow, more than 16 reads are stuck: flying + 16. Q's "if 16 are stuck, don't open more" holds for the
-      stuck reads' own room.</li>
   <li><b>Reads to slow files count as stuck from the start</b>, not after 50&nbsp;ms (3.1).</li>
   <li><b>One read at a time for a file with no finished read</b>, and <b>at most flying + 16 open files</b>: neither was in
       the request; both keep a newly met slow file, or many of them, from swallowing the flying reads.</li>
+  <li><b>The stuck cap can be passed for a moment</b> (3.3), since a read can't be known to be stuck before it's sent.
+      Nothing is canceled to get back under it; finished stuck reads just aren't replaced.</li>
 </ul>
 
 <h2>5. What was verified, and how</h2>
 <ul>
-  <li><b><code>make test</code></b>: <code>go vet</code>, then 54 tests with the race detector, all passing (the diagnostic
+  <li><b><code>make test</code></b>: <code>go vet</code>, then 55 tests with the race detector, all passing (the diagnostic
       is skipped by design). New or rewritten:
     <ul>
       <li><code>TestSlowFileGetsTheStuckRoom</code>: a slow file (200&nbsp;ms reads, served in parallel) and 16 fresh ones,
-          4 flying reads. With room for 16 stuck, the slow file had up to 20 reads at once (16, plus the 4 once the fresh
-          files were done), never more than 20 in all, and all 64 fresh chunks were done before the slow file was half
-          done. With no room, the slow file had at most 4, and so did everything.</li>
-      <li><code>TestEverythingStuckStaysWithinTheRoom</code>: every read 100&nbsp;ms; at most 20 in flight (4 + 16), and no
-          read left counted as stuck after the run.</li>
-      <li>Tuner, in virtual time: doubles while it pays and stops at the knee (4&nbsp;&rarr;&nbsp;8&nbsp;&rarr;&nbsp;16, 32
-          not kept); stays when more doesn't help; a recheck moves 16&nbsp;&rarr;&nbsp;8 when more starts to hurt; fixed
+          4 flying reads. With room for 16 stuck, the slow file had 16 reads at once and never more, and all 64 fresh
+          chunks were done before the slow file was half done. With no room, the slow file had at most 4, and so did
+          everything.</li>
+      <li><code>TestStuckReadsStopAtTheCap</code>: every read 100&nbsp;ms, 8 flying readers (as if the tuner had climbed in
+          fresh data). At most 16 reads in flight, 16 counted stuck at once, and none left counted stuck after the run.
+          Before the fix, the same case ran 24.</li>
+      <li>Tuner, in virtual time: climbs 4 at a time and stops at the knee (4&nbsp;&rarr;&nbsp;8&nbsp;&rarr;&nbsp;12&nbsp;&rarr;&nbsp;16,
+          20 not kept); no ceiling at 32 (a drive whose gains end at 40 goes to 40); stays when more doesn't help; rechecks
+          step 16&nbsp;&rarr;&nbsp;12&nbsp;&rarr;&nbsp;8 when more starts to hurt; fixed
           never moves; starved holds, and starvation mid-test goes back; too few flying reads holds; steady under jitter;
           ops begun before a change don't count.</li>
       <li><code>TestOrders</code> (1 flying read, no stuck room) still copies in exact dfs and hash order.</li>
@@ -186,13 +206,17 @@ flying reads off slow files, and a fast file may take every flying read.</p>
       46&nbsp;s, no errors, and <code>diff -r</code> against the source finds no difference.</li>
   <li><b><code>make tuner-diag</code></b>, the same tree through the simulated drive:
     <table>
-      <tr><th>Run</th><th>Time</th><th>Average</th><th>Reads allowed, on average</th><th>Counted stuck, on average</th></tr>
-      <tr><td>hash order (default)</td><td>46&nbsp;s</td><td>21.1&nbsp;MB/s</td><td>19.9</td><td>19.3</td></tr>
-      <tr><td>dfs order</td><td>46&nbsp;s</td><td>21.1&nbsp;MB/s</td><td>19.9</td><td>19.6</td></tr>
-      <tr><td>rclone's shape (4 &times; 1M, no stuck room, fixed)</td><td>151&nbsp;s</td><td>6.4&nbsp;MB/s</td><td>4.0</td><td>3.9</td></tr>
+      <tr><th>Run</th><th>Time</th><th>Average</th><th>Reads in flight, on average</th><th>Counted stuck, on average</th><th>Most stuck at once</th></tr>
+      <tr><td>hash order (default)</td><td>46&nbsp;s</td><td>21.1&nbsp;MB/s</td><td>16.6</td><td>16.2</td><td>20</td></tr>
+      <tr><td>dfs order</td><td>46&nbsp;s</td><td>21.1&nbsp;MB/s</td><td>16.2</td><td>16.0</td><td>20</td></tr>
+      <tr><td>rclone's shape (4 &times; 1M, no stuck room, fixed)</td><td>151&nbsp;s</td><td>6.4&nbsp;MB/s</td><td>4.0</td><td>3.9</td><td>4</td></tr>
     </table>
-    For comparison: v2's tuner took 141&nbsp;s in hash order and 54&nbsp;s in dfs order; 0.1.0 took 52&nbsp;s. The tuner made no
-    change in either run: it recorded "too few flying reads" or "starved" each time it tried (7.2 explains why).</li>
+    For comparison: v2's tuner took 141&nbsp;s in hash order and 54&nbsp;s in dfs order; 0.1.0 took 52&nbsp;s; the first cut
+    of v3 (all slots on slow work, about 20 in flight) also took 46&nbsp;s in both orders, so the 4 extra stuck reads bought
+    nothing here. The most stuck at once, 20, is the moment the cap can't prevent (3.3): first reads of new files landing on
+    old data. The tuner made no change in either run. It called "starved" each time it tried, because once the stuck room
+    was full the flying readers had no fresh work (7.1 explains why). This run was built just before steps of 4 replaced
+    doubling; since the flying number never moved, the step size didn't come into it.</li>
   <li><b>Display</b>: frames from a simulated copy checked by eye; <code>TestFramesFitEveryTerminal</code> still covers
       widths from 20 columns up.</li>
 </ul>
@@ -216,19 +240,18 @@ mix isn't either.</p>
 
 <h2>7. Concerns and open issues</h2>
 
-<h3>7.1 When everything is stuck, in flight is flying + 16, and flying may have grown</h3>
-<p>Rule 3 makes a fully slow stretch run <code>flying + 16</code> reads, all stuck. At the default 4 that's 20. But the flying
-number only changes on measurements of flying reads, and with none flying it holds wherever a fast stretch left it: up to 32,
-so up to 48 stuck reads. Q's "don't go past 16 if they're all blocked" suggests a rule such as "with nothing flying for a few
-seconds, the flying number goes back to its start". Not built; Q's call.</p>
-
-<h3>7.2 The simulator can't show the two kinds of read helping each other</h3>
+<h3>7.1 The simulator can't show the two kinds of read helping each other</h3>
 <p>The simulated drive serves every read through one queue, so with 16 slow reads queued, a fast read waits behind them and
 counts as stuck too. That's why the diagnostic shows almost every read stuck and the tuner never finding enough flying reads
-to test. On that drive model it's harmless: the slow bandwidth is saturated with about 14 reads in flight, and 20 keeps it
+to test. On that drive model it's harmless: the slow bandwidth is saturated with about 14 reads in flight, and 16 keeps it
 saturated. Showing fresh files flying past slow ones needs either a real drive whose slow reads don't block fast ones, or
 the simulator variant with separate slow and fast resources that v2 proposed. Neither exists yet.
 <code>TestSlowFileGetsTheStuckRoom</code> shows the engine side with sleeps standing in for the drive.</p>
+
+<h3>7.2 Is 16 the right cap?</h3>
+<p>It's a fixed bet, now a flag. If the real drive's slow regions keep speeding up past 16 reads at once, a higher
+<code>--max-stuck</code> would copy old data faster; if they don't, 16 already queues more than helps, and only costs a
+slower Ctrl-C and a slower return to fresh data. Only a run on the real drive (in a Thunderbolt enclosure) can say.</p>
 
 <h3>7.3 A log with home-folder paths (found during this work)</h3>
 <p>The first <code>make tuner-diag</code> run failed (the demo tree's path was relative, and <code>go test</code> runs in the
