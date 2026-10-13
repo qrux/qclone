@@ -55,7 +55,8 @@ func opts(errPath string) Options {
 	return Options{
 		Readers:      4,
 		Tuner:        cfg,
-		MaxStuck:     16,
+		SlowLane:     4,
+		Queue:        32,
 		Chunk:        256 << 10,
 		ModifyWindow: time.Second,
 		Retries:      3,

@@ -86,63 +86,79 @@ Reads and writes also bypass the macOS file cache (`F_NOCACHE`, `--cached` to
 turn that off). That way the rate shown is the disk's own, not a burst into
 memory followed by a stall while it flushes.
 
-## Stuck reads don't hold up the rest
+## Fresh data flows while old data grinds
 
 Every file is cut into chunks (256 KiB; `--chunk` changes it), and a pool of
 readers takes chunks as they come free. So a big file is read by several
 readers at once, and small files are copied side by side.
 
-A read that has been in flight longer than 50 ms is **stuck**. A healthy SSD
-reads a chunk in about a millisecond; old data on a degraded one takes hundreds
-of milliseconds, or seconds. Every other read is **flying**. qclone keeps
+Each 32 MiB of a file is a **region**, judged on its own by its reads. A read
+of a healthy SSD takes about a millisecond; old data on a degraded one takes
+hundreds of milliseconds, or seconds. A region is **unknown** until a read of
+it comes back, **fresh** while its reads come back within 50 ms, and **slow**
+(quarantined) once one doesn't. Data written together sits together and ages
+together, so one read is a good guess for a region, while a big file (a disk
+image, a database) can hold old and fresh regions side by side.
 
-```
-reads in flight = flying + min(stuck, 16)
-```
+Three numbers govern what's in flight:
 
-so stuck reads never use up the flying ones' room. Stuck reads are what's
-capped: once 16 are stuck (`--max-stuck`), nothing more goes to slow files.
-Flying reads have no fixed cap; the tuner adds them only while they pay. A
-reader that comes free goes, in this order:
+- **Q, the queue:** the most reads in flight in all, so nothing piles up
+  waiting in macOS. It's measured before copying starts: qclone reads 4 KiB
+  pieces of the first fresh file it finds at 1, 2, 4 ... 64 at a time, and Q is
+  where more stops adding reads per second. A drive reports its own queue
+  length, but an enclosure's bridge can take fewer, or pass commands on one at
+  a time; measuring covers every layer at once. With no fresh data found
+  within 5 seconds, Q is 32, a SATA drive's queue. `--queue N` sets it.
+- **R, the slow lane:** how many reads of slow regions go on at once while
+  there's fresh work too. It's measured like the flying reads below, on slow
+  reads, from 4, and is at most Q - 4, so a few slots are always left for fresh
+  data. `--slow-lane N` sets it.
+- **W, the flying reads:** reads of fresh regions (below).
 
-1. While fewer than 16 reads are stuck, to a slow file's next chunk. A file is
-   slow while it has a stuck read, or if its last read was slow. Reads sent to
-   a slow file count as stuck from the start, so slow files carry on in the
-   stuck reads' room and take nothing from the flying ones.
-2. Otherwise, to a file with nothing stuck. A file none of whose reads has
-   finished yet gets one read at a time, so finding out that a new file is
-   slow costs one read, not all of them. When no open file has a chunk to
-   give, the next file is opened.
+A reader that comes free goes, in this order:
 
-Otherwise it waits for fresh work. So when everything is slow, reads in flight
-settle at 16, all stuck, and the flying readers wait for fresh data. With
-`--max-stuck 0`, slow files take flying readers' places instead, as every read
-does in rclone.
+1. **The slow lane:** while fewer than R slow reads are out, a slow region's
+   next chunk. These R slots are kept for slow regions whenever they have
+   work.
+2. **Flying reads:** while fewer than W are out, a fresh region's next chunk.
+   While fresh work waits, nothing else goes out ahead of it, so slow reads
+   back off to R as they finish (no read is ever canceled).
+3. **Tries,** when there's no fresh work: the first read of a region nobody
+   has read yet, breadth first. Every open file's first region, then a new
+   file's, then a level deeper in the open files: their middles, then their
+   quarters, and so on. So a few tries sample whole files before any part is
+   looked at closely.
+4. **More slow reads,** in every slot left, but only while nothing fresh is
+   known and no try that might turn out fresh is still out. Until fresh data
+   turns up, a full queue costs nothing and spares the drive waiting on qclone
+   between reads.
+
+When everything left is slow, qclone rides the full queue to the end.
+`--no-lanes` turns all of this off and reads the way rclone does, to compare:
+`--readers` files at once, one read each, in order.
 
 Files go in hash order by default: of the next 1,024 files the walk has found,
 the one whose path hashes lowest goes next. Data written together usually sits
-together in folders, so this mixes old and new data, and there's usually fresh
-work for the flying reads while slow files grind. `--order dfs` copies depth
-first with names sorted; `--order dirent` copies depth first as the disk lists
-them.
+together in folders, so this mixes old and new data, and tries find fresh work
+sooner. `--order dfs` copies depth first with names sorted; `--order dirent`
+copies depth first as the disk lists them.
 
-The number of flying reads tunes itself. It starts at 4 (`--readers`) and
-adds 4 at a time while each step makes the flying reads at least 5% faster;
-when one doesn't, it goes back. Small steps stop close to where more reads stop
-paying, and every flying read too many is one more read that can get stuck
-when old data turns up. Every 30 seconds it tries 4 more and 4 fewer, each
-against a fresh measurement of the current number, and moves only to one that
-is at least 5% faster. A measurement lasts at least a second and 20
-flying reads. Only flying reads are measured. They all read fresh data at
-about the same speed, so a plain before-and-after comparison holds. Throughput
+W and R tune themselves the same way. Each starts at 4 and adds 4 at a time
+while each step makes its own reads at least 5% faster; when one doesn't, it
+goes back. Small steps stop close to where more reads stop paying. Every so
+often (30 s for W, 60 s for R) each tries 4 more and 4 fewer, against a fresh
+measurement of the current number, and moves only to one that is at least 5%
+faster. W is judged only on flying reads, which all read fresh data at about
+the same speed, so a plain before-and-after comparison holds; throughput
 counting every read would mostly measure which slow files happened to be open.
+R is judged on the slow lane's reads, and only while it's in force (fresh and
+slow work both waiting). Slow reads finish in lumps seconds apart, so each of
+its measurements takes at least 3 seconds and 20 reads.
 
-Whether more reads in flight speed up a degraded drive's slow regions depends
-on its controller. If error correction runs on each flash die separately, more
-reads overlap it, and the room for 16 stuck reads pays off. If the controller
-recovers one read at a time, they gain nothing, and fast reads wait behind them
-inside the drive (and then count as stuck too). A USB bridge that doesn't queue
-commands allows one read at a time, whatever qclone asks for.
+Whether more reads in flight speed up a degraded drive's old data depends on
+its controller. If error correction runs on each flash die separately, more
+reads overlap it, and R climbs. If the controller recovers one read at a time,
+R stays low, and fresh reads keep most of the queue.
 
 ## The display
 
@@ -151,7 +167,8 @@ A full-screen ASCII display, redrawn four times a second:
 - an overall progress bar, counts and ETA
 - a log-scale speed chart (2 MB/s and 500 MB/s on one chart), colored by how
   slow each moment was, with the reads in flight charted beneath it
-- the reads in flight, flying and stuck, and the tuner's test in progress or
+- the reads in flight in each lane (flying, slow, trying), the queue and how
+  it was found, the slow regions waiting, and each tuner's test in progress or
   its last verdict
 - the source and destination disks (model, interface, rates, time per read,
   queue depth, the disk's own error and retry counters)
@@ -169,12 +186,15 @@ and paths are never written to stdout, so a log of a run holds none.
                      while that makes them faster
     --max-readers N  most flying reads, if you want a limit (default: none;
                      they're raised only while that pays; 256 at most)
-    --max-stuck N    the most reads stuck over 50 ms, in room of their own
-                     beside the flying ones (default 16); 0: no room of their
-                     own, they take flying reads' places, as in rclone
+    --slow-lane N    keep N reads of slow regions going (default: measured, from
+                     4, at most the queue less 4); 0: no slow lane
+    --queue N        most reads in flight in all (default: measured at the
+                     start on fresh data, else 32)
+    --no-lanes       read every region alike, files in order, --readers at a
+                     time with one read each (rclone's way, to compare)
     --chunk SIZE     bytes per read, e.g. 256K, 4M (default 256K)
     --order ORDER    hash (default), dfs or dirent: the order files go in
-    --fixed          don't tune: keep --readers as given
+    --fixed          don't tune: keep --readers and --slow-lane as given
     --errors FILE    where errors go (default: <timestamp>-qclone-errors.txt here)
     --rescue         install files with unreadable spots, zeros there (listed in the
                      error file; a later run tries those spots again)
@@ -206,7 +226,7 @@ build). Releases are published with `make release VERSION=x.y.z`; see
 make build       # build/qclone
 make test        # vet and all tests, with the race detector
 make demo        # ~1 GB copy on a simulated degraded SSD, to watch the tuner work
-make demo-fixed  # the same copy the way rclone does it: 4 reads x 1M, no room for stuck ones
+make demo-fixed  # the same copy the way rclone does it: 4 files at once, one 1M read each
 make demo-rescue # a failing drive: a plain pass, then a --rescue pass
 make install     # copy qclone to ~/bin
 make release VERSION=x.y.z   # tag, and publish the formula to the Homebrew tap

@@ -9,15 +9,15 @@
 // mode and times and is renamed into place, so a destination file is either
 // the old one or a complete new one, never half-written.
 //
-// A read in flight longer than StuckAfter is stuck, and so is one sent to a
-// file already known to be slow. The gate admits
-//
-//	reads in flight = flying + min(stuck, MaxStuck)
-//
-// where the tuner sets flying, so stuck reads never use up the flying ones'
-// room. Stuck reads are capped instead: once MaxStuck are stuck, nothing more
-// goes to slow files. The dispatcher keeps slow files going in the stuck reads'
-// room and the flying reads on files with nothing stuck (pick).
+// Files are cut into regions (32 MiB), each judged on its own: unknown until a
+// read of it comes back, then fresh while its reads take less than StuckAfter
+// (50 ms), or slow, and quarantined, once one doesn't. Reads in flight never
+// exceed the queue length Q, measured at the start (calibrate.go). Within it,
+// pick hands out, in order: up to R reads of slow regions (the slow lane, R
+// measured, at most Q - 4); up to W flying reads of fresh regions (W tuned);
+// when there's no fresh work, tries of unknown regions, breadth first; and
+// until something fresh turns up, more slow reads in every slot left. Once
+// fresh work exists, slow reads back off to R as they finish.
 package copier
 
 import (
@@ -46,12 +46,16 @@ import (
 
 // Options configure a run.
 type Options struct {
-	Readers      int           // flying reads at the start
-	Tuner        tuner.Config  // Tuner.MaxReaders: a backstop on flying reads; the tuner stops adding them when they stop paying
-	MaxStuck     int           // the most stuck reads, in room of their own; 0: none, they take flying slots
-	StuckAfter   time.Duration // a read in flight this long is stuck (0: 50 ms)
+	Readers      int           // flying reads at the start (W)
+	Tuner        tuner.Config  // for W; Tuner.MaxReaders is an optional limit
+	SlowLane     int           // R at the start; R is measured unless SlowFixed
+	SlowFixed    bool          // keep R at SlowLane (0: no slow lane)
+	Queue        int           // Q, the most reads in flight; 0: measured at the start, else 32
+	NoLanes      bool          // read every region alike, in order, Readers at a time (rclone's way, to compare)
+	StuckAfter   time.Duration // a read in flight this long is slow (0: 50 ms)
 	Chunk        int           // bytes per read (0: 256 KiB)
-	Fixed        bool          // never change the number of flying reads
+	RegionSize   int64         // 0: 32 MiB
+	Fixed        bool          // never change W or R
 	Cached       bool          // read and write through the OS cache
 	ModifyWindow time.Duration // mtimes this close count as equal
 	Retries      int           // read attempts per chunk
@@ -67,9 +71,20 @@ const hashWindow = 1024
 const (
 	defaultStuckAfter = 50 * time.Millisecond
 	defaultChunk      = 256 << 10
-	controlTick       = 20 * time.Millisecond  // marking stuck reads, stepping the tuner
+	defaultRegion     = 32 << 20
+	defaultQueue      = 32                     // a SATA drive's command queue, when nothing better is known
+	maxQueue          = 256                    // workers in the pool
+	fastReserve       = 4                      // R is at most Q - 4: slots always left for fresh reads
+	controlTick       = 20 * time.Millisecond  // marking stuck reads, stepping the tuners
 	dispatchTick      = 20 * time.Millisecond  // the dispatcher looks again at least this often
-	starvedAfter      = 100 * time.Millisecond // readers waiting for work this long: nothing to measure
+	starvedAfter      = 100 * time.Millisecond // a lane short of work this long: nothing to measure
+)
+
+// Lanes a read can go out in.
+const (
+	laneFly  = iota // a fresh region's chunk: one of W
+	laneSlow        // a slow region's chunk: counted as stuck from the start
+	laneTry         // the first read of an unknown region
 )
 
 // Active is one file in flight.
@@ -113,9 +128,14 @@ type Snapshot struct {
 	ErrorFile                                        string
 	LastError                                        string
 	Retries                                          int64
-	Readers                                          int // reads that may be in flight: flying + min(stuck, MaxStuck)
-	Reading                                          int // reads in flight now
-	Stuck, PeakStuck, MaxStuck                       int // stuck reads now, the most at once, and the room they get
+	SlowTuner                                        tuner.Status // R; Mode "off" when there's no slow lane
+	Queue                                            int          // Q
+	QueueHow                                         string       // "measured", "set", or "default" (no fresh data to measure)
+	SlowLane                                         int          // R
+	InFly, InSlow, InTry                             int          // reads in flight in each lane
+	Reading                                          int          // reads in flight now
+	Stuck, PeakStuck                                 int          // reads in flight over StuckAfter (or in the slow lane), now and at most
+	Quarantined                                      int          // slow regions with chunks waiting
 	Chunk                                            int
 	BytesResumed                                     int64 // carried over from earlier runs' partial files
 	BytesZeroed                                      int64 // zeros written for unreadable ranges (--rescue)
@@ -133,11 +153,8 @@ type file struct {
 	meter               *rate.Meter
 	done                atomic.Int64
 	refs                atomic.Int64
-	inflight            atomic.Int64 // chunks handed out and not yet finished
-	stuck               atomic.Int64 // reads of it in flight now that count as stuck
-	lastSlow            atomic.Bool  // its last finished read took longer than StuckAfter
-	proven              atomic.Bool  // a read of it has finished
-	key, seq            uint64       // the queue's order: path hash (or seq), then the order found
+	regionsLeft         int    // regions still with chunks to hand out (the dispatcher's own count)
+	key, seq            uint64 // the queue's order: path hash (or seq), then the order found
 
 	once    sync.Once
 	sf, df  *os.File
@@ -174,18 +191,20 @@ func (f *file) fail(op string, err error) {
 
 type job struct {
 	f    *file
+	r    *region
 	off  int64
 	n    int
-	slow bool // sent to a slow file: counted as stuck from the start
+	lane int
 }
 
 // slot is one worker's read in flight, as the control loop sees it.
 type slot struct {
 	mu    sync.Mutex
-	f     *file
+	r     *region
 	start time.Duration // from the run's start; < 0 when not reading
-	stuck bool          // counted in Engine.stuck and f.stuck now
-	was   bool          // counted as stuck at some point: not a flying read
+	lane  int
+	stuck bool // counted in Engine.stuck and r.stuck now
+	was   bool // counted as stuck at some point: not a flying read
 }
 
 type dirAttr struct {
@@ -229,13 +248,23 @@ type Engine struct {
 	opt   Options
 	start time.Time
 
-	tuner      *tuner.Tuner
+	tuner      *tuner.Tuner // W
+	slowTuner  *tuner.Tuner // R; nil when there's no slow lane or it's fixed
 	gate       *gate
 	stuckAfter time.Duration
-	flying     atomic.Int64 // the tuner's number of flying reads
+	queue      atomic.Int64 // Q
+	queueHow   atomic.Value // string
+	flying     atomic.Int64 // W
+	slowLane   atomic.Int64 // R
+	slowOn     atomic.Bool  // the slow tuner is in use (Q leaves room for a slow lane)
+	inLane     [3]atomic.Int64
+	pending    atomic.Int64 // tries out that have neither come back nor gone stuck: maybe fresh
 	stuck      atomic.Int64 // reads in flight now that count as stuck
 	reading    atomic.Int64 // reads in flight now
 	peakStuck  atomic.Int64
+	quarantine atomic.Int64  // slow regions with chunks waiting
+	flyShort   atomic.Int64  // since when W couldn't be filled for lack of fresh work (nanos from start + 1); 0: it could
+	slowShort  atomic.Int64  // since when R wasn't in force or couldn't be filled; 0: it was
 	nudge      chan struct{} // tells the dispatcher something changed
 	seq        atomic.Uint64
 	global     *rate.Meter
@@ -249,13 +278,13 @@ type Engine struct {
 	badRanges, badBytes, badFiles                    atomic.Int64
 	scanning, dispatchDone                           atomic.Bool
 	canceled, done                                   atomic.Bool
-	idleSince                                        atomic.Int64 // when readers began waiting for work (nanos from start + 1); 0 when none wait
 
-	q       fileQueue
-	want    chan chan job // a worker through the gate asks for a chunk
-	quit    chan struct{} // closed when the dispatcher has nothing more
-	workers []slot
-	rr      int // the dispatcher's round-robin position
+	q         fileQueue
+	want      chan chan job // a worker through the gate asks for a chunk
+	quit      chan struct{} // closed when the dispatcher has nothing more
+	workers   []slot
+	rr        int // the dispatcher's round-robin position
+	filesOpen int // files with regions still to hand out (the dispatcher's own count)
 
 	mu      sync.Mutex
 	active  map[*file]struct{}
@@ -281,8 +310,14 @@ func New(p *plan.Plan, opt Options) *Engine {
 	if opt.Chunk <= 0 {
 		opt.Chunk = defaultChunk
 	}
-	if opt.MaxStuck < 0 {
-		opt.MaxStuck = 0
+	if opt.RegionSize <= 0 {
+		opt.RegionSize = defaultRegion
+	}
+	if opt.Queue > maxQueue {
+		opt.Queue = maxQueue
+	}
+	if opt.SlowLane < 0 {
+		opt.SlowLane = 0
 	}
 	now := time.Now()
 	e := &Engine{
@@ -302,12 +337,25 @@ func New(p *plan.Plan, opt Options) *Engine {
 	if e.stuckAfter <= 0 {
 		e.stuckAfter = defaultStuckAfter
 	}
-	e.flying.Store(int64(e.tuner.Readers()))
-	e.gate = newGate(e.tuner.Readers())
-	// Enough workers for the most flying reads plus the stuck reads' room.
-	e.workers = make([]slot, opt.Tuner.MaxReaders+opt.MaxStuck)
+	e.workers = make([]slot, maxQueue)
 	for i := range e.workers {
 		e.workers[i].start = -1
+	}
+	e.gate = newGate(0)
+	if !opt.NoLanes && !opt.Fixed && !opt.SlowFixed {
+		start := opt.SlowLane
+		if start < 1 {
+			start = 4
+		}
+		e.slowTuner = tuner.New(slowTunerConfig(maxQueue), start, false)
+	}
+	switch {
+	case opt.NoLanes:
+		e.setQueue(e.tuner.Readers(), "set")
+	case opt.Queue > 0:
+		e.setQueue(opt.Queue, "set")
+	default:
+		e.setQueue(defaultQueue, "default") // until measured
 	}
 	window := 1
 	if opt.Order == plan.OrderHash {
@@ -624,38 +672,60 @@ func (e *Engine) copyLink(en plan.Entry) {
 	e.links.Add(1)
 }
 
-// openFile is a file the dispatcher is cutting into chunks.
-type openFile struct {
-	f    *file
-	todo ranges // what's left to hand out
-	zero bool   // nothing to read, but one empty job must still go, so it's opened and finished
+// region is a stretch of a file, at most RegionSize long, that the dispatcher
+// hands out chunk by chunk and judges on its own: unknown until a read of it
+// has finished, then fresh while its reads come back fast, or slow
+// (quarantined) once one doesn't. Data written together sits together and ages
+// together, so one read is a good guess for the rest of a region, while a big
+// file can hold old and fresh stretches side by side.
+type region struct {
+	f        *file
+	todo     ranges // what's left to hand out
+	zero     bool   // nothing to read, but one empty job must still go, so the file is opened and finished
+	rank     int    // its place in the file's breadth-first descent: 0 is its start, then its middle, its quarters, ...
+	inflight atomic.Int64
+	stuck    atomic.Int64 // reads of it in flight now that count as stuck
+	lastSlow atomic.Bool  // its last finished read took longer than StuckAfter
+	proven   atomic.Bool  // a read of it has finished
 }
 
-func (o *openFile) next(chunk int64) job {
-	if o.zero {
-		o.zero = false
-		return job{f: o.f}
+func (r *region) next(chunk int64) job {
+	if r.zero {
+		r.zero = false
+		return job{f: r.f, r: r}
 	}
-	g := &o.todo[0]
+	g := &r.todo[0]
 	n := chunk
 	if n > g.Len {
 		n = g.Len
 	}
-	j := job{f: o.f, off: g.Off, n: int(n)}
+	j := job{f: r.f, r: r, off: g.Off, n: int(n)}
 	g.Off += n
 	g.Len -= n
 	if g.Len == 0 {
-		o.todo = o.todo[1:]
+		r.todo = r.todo[1:]
 	}
 	return j
 }
 
-func (o *openFile) exhausted() bool { return !o.zero && len(o.todo) == 0 }
+func (r *region) exhausted() bool { return !r.zero && len(r.todo) == 0 }
 
-func (e *Engine) startFile(f *file) *openFile {
+// slow: a read of it is stuck now, or its last one took too long.
+func (r *region) slow() bool { return r.stuck.Load() > 0 || r.lastSlow.Load() }
+
+func slowRegion(r *region) bool  { return !r.exhausted() && r.slow() }
+func freshRegion(r *region) bool { return !r.exhausted() && r.proven.Load() && !r.slow() }
+
+// untried: no read of it has come back, and none is out now.
+func untried(r *region) bool {
+	return !r.exhausted() && !r.proven.Load() && r.inflight.Load() == 0 && r.stuck.Load() == 0
+}
+
+// startFile opens f for the dispatcher and cuts what's left of it into regions.
+func (e *Engine) startFile(f *file) []*region {
 	f.started = time.Now()
 	f.meter = rate.New(f.started)
-	f.refs.Store(1) // the dispatcher's own reference
+	f.refs.Store(1) // the dispatcher's own reference, until its last region is handed out
 	e.mu.Lock()
 	e.active[f] = struct{}{}
 	e.mu.Unlock()
@@ -666,31 +736,88 @@ func (e *Engine) startFile(f *file) *openFile {
 		todo = f.doneSet.gaps(f.size)
 		f.rangeMu.Unlock()
 	}
-	o := &openFile{f: f, todo: todo}
+	var rs []*region
 	if todo.total() == 0 {
-		o.todo, o.zero = nil, true
+		rs = []*region{{f: f, zero: true}}
+	} else {
+		size := e.opt.RegionSize
+		byIndex := map[int64]*region{}
+		for _, g := range todo {
+			for off, end := g.Off, g.Off+g.Len; off < end; {
+				i := off / size
+				stop := min((i+1)*size, end)
+				r := byIndex[i]
+				if r == nil {
+					r = &region{f: f}
+					byIndex[i] = r
+					rs = append(rs, r) // in offset order: todo is sorted
+				}
+				r.todo = append(r.todo, span{off, stop - off})
+				off = stop
+			}
+		}
+		for k, pos := range breadthFirst(len(rs)) {
+			rs[pos].rank = k
+		}
 	}
-	return o
+	f.regionsLeft = len(rs)
+	e.filesOpen++
+	return rs
+}
+
+// breadthFirst lists 0..n-1 in a breadth-first descent: the start, then the
+// middle, then the quarters, and so on, so the first few tries sample a whole
+// file before any part of it is looked at closely.
+func breadthFirst(n int) []int {
+	if n == 0 {
+		return nil
+	}
+	order := []int{0}
+	seen := make([]bool, n)
+	seen[0] = true
+	queue := [][2]int{{0, n}}
+	for len(queue) > 0 {
+		lo, hi := queue[0][0], queue[0][1]
+		queue = queue[1:]
+		if hi-lo < 2 {
+			continue
+		}
+		mid := (lo + hi) / 2
+		if !seen[mid] {
+			seen[mid] = true
+			order = append(order, mid)
+		}
+		queue = append(queue, [2]int{lo, mid}, [2]int{mid, hi})
+	}
+	return order
 }
 
 // dispatch hands each worker that asks the chunk pick chooses at that moment.
 func (e *Engine) dispatch(ctx context.Context) {
-	var open []*openFile
+	var open []*region
 	var waiting []chan job
 	walkDone := false
 	defer func() {
-		for _, o := range open {
-			o.f.canceled.Store(true)
-			e.release(o.f)
+		released := map[*file]bool{}
+		for _, r := range open {
+			if !released[r.f] {
+				released[r.f] = true
+				r.f.canceled.Store(true)
+				e.release(r.f)
+			}
 		}
 		e.dispatchDone.Store(true)
 		close(e.quit)
-		for _, r := range waiting {
-			close(r)
+		for _, c := range waiting {
+			close(c)
 		}
 	}()
+	if e.queueHow.Load() == "default" {
+		e.measureQueue(ctx, &open, &walkDone)
+	}
 	t := time.NewTimer(dispatchTick)
 	defer t.Stop()
+	var noted time.Time
 	for {
 		if ctx.Err() != nil {
 			return
@@ -703,10 +830,9 @@ func (e *Engine) dispatch(ctx context.Context) {
 			waiting[0] <- j
 			waiting = waiting[1:]
 		}
-		if len(waiting) == 0 {
-			e.idleSince.Store(0)
-		} else if e.idleSince.Load() == 0 {
-			e.idleSince.Store(int64(time.Since(e.start)) + 1)
+		if now := time.Now(); now.Sub(noted) >= dispatchTick/2 {
+			noted = now
+			e.note(open)
 		}
 		if walkDone && len(open) == 0 {
 			return
@@ -723,63 +849,130 @@ func (e *Engine) dispatch(ctx context.Context) {
 	}
 }
 
-// pick chooses the next chunk for a worker that's ready, in this order:
+// pick chooses the next chunk for a worker that's ready, within Q reads in
+// flight, in this order:
 //
-//  1. While fewer than MaxStuck reads are stuck, a slow file's next chunk,
-//     counted as stuck from the start. Slow files keep going in the room stuck
-//     reads have, without taking any from the flying reads.
-//  2. A chunk of a file with nothing stuck. A file none of whose reads has
-//     finished yet gets one read at a time, so finding out that a new file is
-//     slow costs one read, not all of them. If no open file has a chunk to
-//     give, the next file is opened, while fewer than flying + MaxStuck files
-//     are open.
-//
-// Otherwise the reader waits for fresh work: once MaxStuck reads are stuck,
-// nothing more goes to slow files, so a stretch where everything is slow
-// settles at MaxStuck reads in flight. With MaxStuck 0 there is no room of
-// their own, and slow files take flying slots instead, as all reads do in
-// rclone.
-func (e *Engine) pick(open *[]*openFile, walkDone *bool) (job, bool) {
-	if int(e.stuck.Load()) < e.opt.MaxStuck {
-		if o := e.choose(*open, slowFile); o != nil {
-			return e.take(open, o, true), true
+//  1. The slow lane: while fewer than R slow reads are out, a slow region's
+//     next chunk. These R slots are kept for slow regions whenever they have
+//     work, however many attempts are stuck elsewhere.
+//  2. Flying reads: while fewer than W are out, a fresh region's next chunk.
+//     When fresh work is waiting, nothing else goes out ahead of it: that's
+//     the quarantine, and slow reads back off to R as they finish.
+//  3. With no fresh work: a try, the first read of a region nobody has read
+//     yet, breadth first (nextTry).
+//  4. With no fresh work, nothing left to try, and no try still out that
+//     might turn out fresh: more slow reads, in every slot left. Until
+//     something fresh turns up, a full queue costs nothing and spares the
+//     drive waiting on qclone between reads.
+func (e *Engine) pick(open *[]*region, walkDone *bool) (job, bool) {
+	inFly, inSlow, inTry := e.inLane[laneFly].Load(), e.inLane[laneSlow].Load(), e.inLane[laneTry].Load()
+	if inFly+inSlow+inTry >= e.queue.Load() {
+		return job{}, false
+	}
+	if e.opt.NoLanes {
+		return e.pickInOrder(open, walkDone)
+	}
+	if inSlow < e.slowLane.Load() {
+		if r := e.choose(*open, slowRegion); r != nil {
+			return e.take(open, r, laneSlow), true
 		}
 	}
-	if o := e.choose(*open, fastFile); o != nil {
-		return e.take(open, o, false), true
-	}
-	if !*walkDone && len(*open) < int(e.flying.Load())+e.opt.MaxStuck {
-		f, done := e.q.tryPop(time.Now())
-		if f != nil {
-			o := e.startFile(f)
-			*open = append(*open, o)
-			return e.take(open, o, false), true
+	if fresh := e.choose(*open, freshRegion); fresh != nil {
+		if inFly < e.flying.Load() {
+			return e.take(open, fresh, laneFly), true
 		}
-		*walkDone = done
+		return job{}, false
 	}
-	if e.opt.MaxStuck == 0 {
-		if o := e.choose(*open, slowFile); o != nil {
-			return e.take(open, o, true), true
+	if r := e.nextTry(open, walkDone); r != nil {
+		return e.take(open, r, laneTry), true
+	}
+	if inFly == 0 && e.pending.Load() == 0 {
+		if r := e.choose(*open, slowRegion); r != nil {
+			return e.take(open, r, laneSlow), true
 		}
 	}
 	return job{}, false
 }
 
-// slowFile: an open file with a chunk to give and a stuck read, or whose last
-// read was slow.
-func slowFile(o *openFile) bool {
-	return !o.exhausted() && (o.f.stuck.Load() > 0 || o.f.lastSlow.Load())
+// nextTry picks a region nobody has read yet, breadth first across files and
+// within them: every open file's first region, then a new file's, then the
+// next level down in the open files (their middles, then their quarters, ...).
+// A region gets one try at a time. New files open while fewer than 2Q are open.
+func (e *Engine) nextTry(open *[]*region, walkDone *bool) *region {
+	var best *region
+	for _, r := range *open {
+		if untried(r) && (best == nil || r.rank < best.rank) {
+			best = r
+			if r.rank == 0 {
+				break
+			}
+		}
+	}
+	if (best == nil || best.rank > 0) && !*walkDone && e.filesOpen < 2*int(e.queue.Load()) {
+		f, done := e.q.tryPop(time.Now())
+		if f != nil {
+			rs := e.startFile(f)
+			*open = append(*open, rs...)
+			return rs[0]
+		}
+		*walkDone = done
+	}
+	return best
 }
 
-// fastFile: an open file with a chunk to give and nothing stuck; until one of
-// its reads has finished, only one at a time.
-func fastFile(o *openFile) bool {
-	return !o.exhausted() && o.f.stuck.Load() == 0 && !o.f.lastSlow.Load() &&
-		(o.f.proven.Load() || o.f.inflight.Load() == 0)
+// pickInOrder reads the way rclone does, to compare: up to W files at once,
+// each read one chunk at a time from start to end, in the walk's order.
+func (e *Engine) pickInOrder(open *[]*region, walkDone *bool) (job, bool) {
+	busy := map[*file]bool{}
+	for _, r := range *open {
+		if busy[r.f] {
+			continue
+		}
+		busy[r.f] = true
+		if r.inflight.Load() == 0 && !r.exhausted() {
+			return e.take(open, r, laneFly), true
+		}
+	}
+	if !*walkDone && e.filesOpen < int(e.flying.Load()) {
+		f, done := e.q.tryPop(time.Now())
+		if f != nil {
+			rs := e.startFile(f)
+			*open = append(*open, rs...)
+			return e.take(open, rs[0], laneFly), true
+		}
+		*walkDone = done
+	}
+	return job{}, false
 }
 
-// choose returns the next open file, in turn, that ok accepts.
-func (e *Engine) choose(open []*openFile, ok func(*openFile) bool) *openFile {
+// note records, for the tuners and the display, whether each lane could be
+// kept full and how many slow regions wait.
+func (e *Engine) note(open []*region) {
+	fresh, slow := false, 0
+	for _, r := range open {
+		switch {
+		case freshRegion(r):
+			fresh = true
+		case slowRegion(r):
+			slow++
+		}
+	}
+	e.quarantine.Store(int64(slow))
+	now := int64(time.Since(e.start)) + 1
+	set := func(a *atomic.Int64, short bool) {
+		if !short {
+			a.Store(0)
+		} else if a.Load() == 0 {
+			a.Store(now)
+		}
+	}
+	set(&e.flyShort, !fresh && e.inLane[laneFly].Load() < e.flying.Load())
+	// R is in force only while fresh work holds slow reads down to it.
+	set(&e.slowShort, !(fresh || e.inLane[laneFly].Load() > 0) || slow == 0)
+}
+
+// choose returns the next open region, in turn, that ok accepts.
+func (e *Engine) choose(open []*region, ok func(*region) bool) *region {
 	for i := range open {
 		k := (e.rr + i) % len(open)
 		if ok(open[k]) {
@@ -790,30 +983,76 @@ func (e *Engine) choose(open []*openFile, ok func(*openFile) bool) *openFile {
 	return nil
 }
 
-// take cuts o's next chunk and hands it out; slow counts it as stuck now.
-func (e *Engine) take(open *[]*openFile, o *openFile, slow bool) job {
-	j := o.next(int64(e.opt.Chunk))
-	j.slow = slow
-	o.f.refs.Add(1)
-	o.f.inflight.Add(1)
-	if slow {
-		e.stick(o.f)
+// take cuts r's next chunk and hands it out in lane.
+func (e *Engine) take(open *[]*region, r *region, lane int) job {
+	j := r.next(int64(e.opt.Chunk))
+	j.lane = lane
+	r.f.refs.Add(1)
+	r.inflight.Add(1)
+	e.inLane[lane].Add(1)
+	switch lane {
+	case laneSlow:
+		e.stick(r)
+	case laneTry:
+		e.pending.Add(1)
 	}
-	if o.exhausted() || o.f.failed.Load() || o.f.canceled.Load() {
+	if r.exhausted() || r.f.failed.Load() || r.f.canceled.Load() {
 		for k := range *open {
-			if (*open)[k] == o {
+			if (*open)[k] == r {
 				*open = append((*open)[:k], (*open)[k+1:]...)
 				break
 			}
 		}
-		e.release(o.f)
+		if r.f.regionsLeft--; r.f.regionsLeft == 0 {
+			e.filesOpen--
+			e.release(r.f)
+		}
 	}
 	return j
 }
 
-// stick counts one more read of f as stuck.
-func (e *Engine) stick(f *file) {
-	f.stuck.Add(1)
+// setQueue sets Q, and with it the slow lane's ceiling, Q - 4, so a few slots
+// are always left for fresh reads. A queue of 4 or less has no slow lane.
+func (e *Engine) setQueue(q int, how string) {
+	q = max(1, min(q, maxQueue))
+	e.queue.Store(int64(q))
+	e.queueHow.Store(how)
+	e.gate.setLimit(q)
+	e.tuner.SetMax(min(e.opt.Tuner.MaxReaders, q))
+	e.flying.Store(int64(e.tuner.Readers()))
+	rmax := q - fastReserve
+	switch {
+	case e.opt.NoLanes || rmax < 1:
+		e.slowOn.Store(false)
+		e.slowLane.Store(0)
+	case e.slowTuner == nil:
+		e.slowOn.Store(false)
+		e.slowLane.Store(int64(min(e.opt.SlowLane, rmax)))
+	default:
+		e.slowTuner.SetMax(rmax)
+		e.slowOn.Store(true)
+		e.slowLane.Store(int64(e.slowTuner.Readers()))
+	}
+	e.poke()
+}
+
+// slowTunerConfig: R is judged on slow reads, which finish in lumps seconds
+// apart, so each measurement needs longer and more of them.
+func slowTunerConfig(max int) tuner.Config {
+	return tuner.Config{
+		MinReaders: 1, MaxReaders: max, Step: 4,
+		Window:    3 * time.Second,
+		MaxWindow: 30 * time.Second,
+		MinOps:    20,
+		Settle:    500 * time.Millisecond,
+		Gain:      0.05,
+		Recheck:   60 * time.Second,
+	}
+}
+
+// stick counts one more read of r as stuck.
+func (e *Engine) stick(r *region) {
+	r.stuck.Add(1)
 	n := e.stuck.Add(1)
 	for {
 		p := e.peakStuck.Load()
@@ -821,24 +1060,13 @@ func (e *Engine) stick(f *file) {
 			break
 		}
 	}
-	e.setLimit()
+	e.poke()
 }
 
-// unstick counts one read of f as no longer stuck: it ended.
-func (e *Engine) unstick(f *file) {
-	f.stuck.Add(-1)
+// unstick counts one read of r as no longer stuck: it ended.
+func (e *Engine) unstick(r *region) {
+	r.stuck.Add(-1)
 	e.stuck.Add(-1)
-	e.setLimit()
-}
-
-// setLimit lets the flying reads through the gate, plus one for each stuck
-// read up to MaxStuck.
-func (e *Engine) setLimit() {
-	s := int(e.stuck.Load())
-	if s > e.opt.MaxStuck {
-		s = e.opt.MaxStuck
-	}
-	e.gate.setLimit(int(e.flying.Load()) + s)
 	e.poke()
 }
 
@@ -850,12 +1078,13 @@ func (e *Engine) poke() {
 	}
 }
 
-// beginRead notes that worker id started reading a chunk of f at now;
+// beginRead notes that worker id started reading a chunk of r at now;
 // counted means the dispatcher already counts it as stuck.
-func (e *Engine) beginRead(id int, f *file, now time.Duration, counted bool) {
+func (e *Engine) beginRead(id int, r *region, lane int, now time.Duration) {
+	counted := lane == laneSlow
 	s := &e.workers[id]
 	s.mu.Lock()
-	s.f, s.start, s.stuck, s.was = f, now, counted, counted
+	s.r, s.lane, s.start, s.stuck, s.was = r, lane, now, counted, counted
 	s.mu.Unlock()
 	e.reading.Add(1)
 }
@@ -869,10 +1098,13 @@ func (e *Engine) endRead(id int, now time.Duration) (wasStuck bool) {
 	if s.start < 0 {
 		return s.was
 	}
-	s.f.lastSlow.Store(now-s.start > e.stuckAfter)
-	s.f.proven.Store(true)
+	s.r.lastSlow.Store(now-s.start > e.stuckAfter)
+	s.r.proven.Store(true)
 	if s.stuck {
-		e.unstick(s.f)
+		e.unstick(s.r)
+	}
+	if s.lane == laneTry && !s.was {
+		e.pending.Add(-1) // came back fast
 	}
 	s.start, s.stuck = -1, false
 	e.reading.Add(-1)
@@ -887,15 +1119,19 @@ func (e *Engine) markStuck(now time.Duration) {
 		s.mu.Lock()
 		if s.start >= 0 && !s.stuck && now-s.start > e.stuckAfter {
 			s.stuck, s.was = true, true
-			e.stick(s.f)
+			e.stick(s.r)
+			if s.lane == laneTry {
+				e.pending.Add(-1) // went stuck: not fresh
+			}
 		}
 		s.mu.Unlock()
 	}
 }
 
-// finished tells the dispatcher a chunk of f is done.
-func (e *Engine) finished(f *file) {
-	f.inflight.Add(-1)
+// finished tells the dispatcher a chunk is done.
+func (e *Engine) finished(j job) {
+	j.r.inflight.Add(-1)
+	e.inLane[j.lane].Add(-1)
 	e.poke()
 }
 
@@ -918,24 +1154,31 @@ func (e *Engine) worker(ctx context.Context, id int) {
 		// Monotonic, from the run's start: the wall clock can jump, and
 		// stands still neither while the Mac sleeps.
 		t0 := time.Now()
-		e.beginRead(id, j.f, t0.Sub(e.start), j.slow)
+		e.beginRead(id, j.r, j.lane, t0.Sub(e.start))
 		if ctx.Err() != nil {
 			e.endRead(id, t0.Sub(e.start))
 			e.gate.release()
 			j.f.canceled.Store(true)
-			e.finished(j.f)
+			e.finished(j)
 			e.release(j.f)
 			continue
 		}
 		n, clean := e.copyChunk(ctx, j, &buf, id)
 		t1 := time.Now()
-		// Only flying reads tell the tuner anything. A chunk that hit
-		// unreadable sectors doesn't either.
-		if stuck := e.endRead(id, t1.Sub(e.start)); clean && !stuck {
-			e.tuner.Record(tuner.Op{Start: t0.Sub(e.start), End: t1.Sub(e.start), Bytes: int64(n)})
+		stuck := e.endRead(id, t1.Sub(e.start))
+		// Each tuner sees only its own lane's reads: W the flying reads that
+		// stayed fast, R the slow lane's. A chunk that hit unreadable
+		// sectors tells neither anything.
+		op := tuner.Op{Start: t0.Sub(e.start), End: t1.Sub(e.start), Bytes: int64(n)}
+		switch {
+		case !clean:
+		case j.lane == laneFly && !stuck:
+			e.tuner.Record(op)
+		case j.lane == laneSlow && e.slowTuner != nil:
+			e.slowTuner.Record(op)
 		}
 		e.gate.release()
-		e.finished(j.f)
+		e.finished(j)
 		e.release(j.f)
 	}
 }
@@ -1255,8 +1498,8 @@ func (e *Engine) logErr(op, path string, err error) {
 	}
 }
 
-// control marks stuck reads and steps the tuner every controlTick, samples the
-// peak rate, and polls the disks.
+// control marks stuck reads and steps the tuners every controlTick, samples
+// the peak rate, and polls the disks.
 func (e *Engine) control(stop <-chan struct{}) {
 	tick := time.NewTicker(controlTick)
 	defer tick.Stop()
@@ -1268,9 +1511,16 @@ func (e *Engine) control(stop <-chan struct{}) {
 			at := now.Sub(e.start)
 			e.markStuck(at)
 			e.pollDevices(now, false)
-			if w := e.tuner.Step(tuner.Probe{Now: at, Starved: e.starved(now)}); int64(w) != e.flying.Load() {
+			end := e.nearEnd(now)
+			if w := e.tuner.Step(tuner.Probe{Now: at, Starved: end || e.short(&e.flyShort, at)}); int64(w) != e.flying.Load() {
 				e.flying.Store(int64(w))
-				e.setLimit()
+				e.poke()
+			}
+			if e.slowOn.Load() {
+				if r := e.slowTuner.Step(tuner.Probe{Now: at, Starved: end || e.short(&e.slowShort, at)}); int64(r) != e.slowLane.Load() {
+					e.slowLane.Store(int64(r))
+					e.poke()
+				}
 			}
 			if i%5 != 0 {
 				continue
@@ -1287,12 +1537,14 @@ func (e *Engine) control(stop <-chan struct{}) {
 	}
 }
 
-// starved: the readers can't all be kept busy, because they've waited for work
-// for a while (the walk is behind the copy) or the copy is nearly done.
-func (e *Engine) starved(now time.Time) bool {
-	if s := e.idleSince.Load(); s != 0 && !e.dispatchDone.Load() && now.Sub(e.start)-time.Duration(s-1) >= starvedAfter {
-		return true
-	}
+// short: a lane has been short of work (since, from note) for starvedAfter.
+func (e *Engine) short(since *atomic.Int64, at time.Duration) bool {
+	s := since.Load()
+	return s != 0 && at-time.Duration(s-1) >= starvedAfter
+}
+
+// nearEnd: less than 10 s of work left, too little to measure anything by.
+func (e *Engine) nearEnd(now time.Time) bool {
 	if e.scanning.Load() {
 		return false
 	}
@@ -1364,11 +1616,16 @@ func (e *Engine) Snapshot() Snapshot {
 		BytesFailed:  e.bytesFailed.Load(),
 		Retries:      e.retries.Load(),
 		Tuner:        e.tuner.Status(now.Sub(e.start)),
-		Readers:      e.gate.limitNow(),
+		Queue:        int(e.queue.Load()),
+		QueueHow:     e.queueHow.Load().(string),
+		SlowLane:     int(e.slowLane.Load()),
+		InFly:        int(e.inLane[laneFly].Load()),
+		InSlow:       int(e.inLane[laneSlow].Load()),
+		InTry:        int(e.inLane[laneTry].Load()),
 		Reading:      int(e.reading.Load()),
 		Stuck:        int(e.stuck.Load()),
 		PeakStuck:    int(e.peakStuck.Load()),
-		MaxStuck:     e.opt.MaxStuck,
+		Quarantined:  int(e.quarantine.Load()),
 		Chunk:        e.opt.Chunk,
 		Canceled:     e.canceled.Load(),
 		Done:         e.done.Load(),
@@ -1380,6 +1637,14 @@ func (e *Engine) Snapshot() Snapshot {
 		FilesRescued: e.filesRescued.Load(),
 		Rescue:       e.opt.Rescue,
 		Peak:         float64frombits(e.peak.Load()),
+	}
+	switch {
+	case e.slowOn.Load():
+		s.SlowTuner = e.slowTuner.Status(now.Sub(e.start))
+	case s.SlowLane > 0:
+		s.SlowTuner = tuner.Status{Mode: "fixed", Readers: s.SlowLane}
+	default:
+		s.SlowTuner = tuner.Status{Mode: "off"}
 	}
 	s.Rate, s.RateOK = e.global.Rate(now)
 	s.Avg, _ = e.global.Average(now)

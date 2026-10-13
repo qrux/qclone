@@ -64,7 +64,9 @@ func fakeSnapshot(now time.Time) copier.Snapshot {
 			History: []tuner.Decision{{At: 40 * time.Second, From: 4, To: 8, Gain: 0.38, Kept: true, Note: "kept"}},
 			Changes: 2,
 		},
-		Readers: 32, Reading: 31, Stuck: 16, PeakStuck: 20, MaxStuck: 16, Chunk: 256 << 10,
+		SlowTuner: tuner.Status{Mode: "holding", Readers: 12, NextCheck: 40 * time.Second,
+			History: []tuner.Decision{{At: 60 * time.Second, From: 12, To: 16, Gain: 0.01, Note: "not kept"}}},
+		Queue: 32, QueueHow: "measured", SlowLane: 12, InFly: 16, InSlow: 12, InTry: 3, Reading: 31, Stuck: 15, PeakStuck: 20, Quarantined: 41, Chunk: 256 << 10,
 		Devices: []copier.DeviceView{
 			{Role: "source", OK: true, Info: devInfo("disk4", "Samsung SSD 840 EVO 1TB", "USB", "Solid State"), Rates: rates(7.9e6, 0, 31, 412*time.Millisecond, 12.9)},
 			{Role: "dest", OK: true, Info: devInfo("disk0", "APPLE SSD AP8192Z", "Apple Fabric", "Solid State"), Rates: rates(0, 7.9e6, 31, 0, 0.3)},
@@ -142,7 +144,7 @@ func TestFramesDuringSimulatedCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	errs := copier.NewErrorLog(filepath.Join(base, "e.txt"), nil, time.Now())
-	eng := copier.New(p, copier.Options{Readers: 4, Tuner: tuner.DefaultConfig(), MaxStuck: 16, Chunk: 1 << 20, ModifyWindow: time.Second, Retries: 3, Errors: errs, Sim: sim.NewDevice(sim.Degraded())})
+	eng := copier.New(p, copier.Options{Readers: 4, Tuner: tuner.DefaultConfig(), SlowLane: 4, Chunk: 1 << 20, ModifyWindow: time.Second, Retries: 3, Errors: errs, Sim: sim.NewDevice(sim.Degraded())})
 	hist := NewHistory(eng.Snapshot().Start)
 	done := make(chan struct{})
 	go func() { eng.Run(context.Background()); close(done) }()
@@ -162,7 +164,7 @@ func TestFramesDuringSimulatedCopy(t *testing.T) {
 		case <-tick.C:
 		}
 		s := eng.Snapshot()
-		hist.Record(s.Now, s.Rate, s.RateOK, s.Readers)
+		hist.Record(s.Now, s.Rate, s.RateOK, s.Reading)
 		lines := Render(f, s, hist)
 		checkFrame(t, lines, f.W, f.H, fmt.Sprintf("frame %d", frames))
 		if s.BytesDone > 0 && !s.Done {

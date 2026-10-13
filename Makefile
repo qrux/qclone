@@ -47,10 +47,10 @@ test:
 demo:
 	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
 
-## demo-fixed: the same copy the way rclone copies, to compare: 4 reads of 1M in flight, in
-##   order, never tuned, and no room for stuck reads (they use up the 4)
+## demo-fixed: the same copy the way rclone copies, to compare: 4 files at once, one 1M read
+##   each, in order, no lanes, never tuned
 demo-fixed:
-	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --fixed --readers 4 --chunk 1M --max-stuck 0 --order dfs --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
+	@cd $(ROOT) && $(LOGGED) sh -c '$(GOBUILD) -o build/qclone ./cmd/qclone && $(GOBUILD) -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --fixed --no-lanes --readers 4 --chunk 1M --order dfs --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
 
 ## demo-rescue: the copy from a simulated failing SSD that has some unreadable sectors: once
 ##   plain (unreadable spots mapped to 4 KiB, those files kept unfinished), then again with
@@ -84,7 +84,7 @@ brew-check:
 	$(CLEANLOGGED) sh -c "brew tap $$owner/tap && brew audit --strict --online $$owner/tap/qclone && brew install --build-from-source $$owner/tap/qclone && brew test $$owner/tap/qclone && qclone --version"
 
 ## tuner-diag: copy the demo tree through the simulated drive in hash order, dfs order, and
-##   rclone's fixed shape; print each one's time, what was in flight, and every tuner
-##   decision; a few minutes. For working on the tuner, not a test.
+##   rclone's way; print each one's time, the queue measured, what was in flight in each
+##   lane, and every decision of both tuners; a few minutes. For working on the tuners.
 tuner-diag:
 	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && QCLONE_DIAG_SRC=$$PWD/$(DEMO)/src go test -trimpath -count=1 -run "TestDiag" -v -timeout 30m ./internal/copier/'

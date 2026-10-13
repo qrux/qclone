@@ -12,12 +12,21 @@ import (
 	"qclone/internal/plan"
 )
 
-// fixed: readers flying reads that never change, room for maxStuck stuck ones.
-func fixed(errPath string, readers, maxStuck int, order plan.Order) Options {
+// lanes: fixed numbers of flying (w) and slow-lane (r) reads, in a queue of q.
+func lanes(errPath string, w, r, q int, order plan.Order) Options {
 	o := opts(errPath)
-	o.Fixed = true
+	o.Fixed, o.SlowFixed = true, true
+	o.Readers, o.SlowLane, o.Queue = w, r, q
+	o.Chunk = 64 << 10
+	o.Order = order
+	return o
+}
+
+// inOrder: rclone's way, readers files at a time, one read each.
+func inOrder(errPath string, readers int, order plan.Order) Options {
+	o := opts(errPath)
+	o.Fixed, o.NoLanes = true, true
 	o.Readers = readers
-	o.MaxStuck = maxStuck
 	o.Chunk = 128 << 10
 	o.Order = order
 	return o
@@ -43,7 +52,7 @@ func TestOrders(t *testing.T) {
 			mu.Unlock()
 			return nil
 		}
-		runWith(t, []string{src + "/", filepath.Join(base, "d-"+order.String())}, fixed(filepath.Join(base, "e.txt"), 1, 0, order), fault)
+		runWith(t, []string{src + "/", filepath.Join(base, "d-"+order.String())}, inOrder(filepath.Join(base, "e.txt"), 1, order), fault)
 		return got
 	}
 	dfs := append([]string(nil), names...)

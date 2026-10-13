@@ -164,6 +164,22 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
+// SetMax changes the most the number may reach, bringing it down if it's over.
+func (t *Tuner) SetMax(n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if n < t.cfg.MinReaders {
+		n = t.cfg.MinReaders
+	}
+	t.cfg.MaxReaders = n
+	if t.w > n {
+		t.apply(n, t.lastNow)
+	}
+	if t.base > n {
+		t.base = n
+	}
+}
+
 // Readers is the number of flying reads to keep in flight now.
 func (t *Tuner) Readers() int {
 	t.mu.Lock()

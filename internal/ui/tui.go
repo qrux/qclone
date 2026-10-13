@@ -194,16 +194,17 @@ func Summary(s copier.Snapshot) []string {
 	l1 += "."
 	out := []string{l1}
 	st := s.Tuner
-	l2 := fmt.Sprintf("qclone: ended at %s x %s", plural(st.Readers, "flying read"), Chunk(s.Chunk))
-	if st.Mode == "fixed" {
+	l2 := fmt.Sprintf("qclone: ended at %s", plural(st.Readers, "flying read"))
+	if s.SlowTuner.Mode != "off" {
+		l2 += fmt.Sprintf(" and a slow lane of %d", s.SlowTuner.Readers)
+	}
+	l2 += fmt.Sprintf(", x %s, %s", Chunk(s.Chunk), queueText(s))
+	if changes := st.Changes + s.SlowTuner.Changes; st.Mode == "fixed" {
 		l2 += " (fixed)"
 	} else {
-		l2 += " after " + plural(st.Changes, "change")
+		l2 += ", after " + plural(changes, "change")
 	}
-	switch {
-	case s.PeakStuck > s.MaxStuck:
-		l2 += fmt.Sprintf("; up to %d reads stuck at once (%d in their own room, the rest in the flying reads')", s.PeakStuck, s.MaxStuck)
-	case s.PeakStuck > 0:
+	if s.PeakStuck > 0 {
 		l2 += fmt.Sprintf("; up to %d reads stuck at once", s.PeakStuck)
 	}
 	out = append(out, l2+".")

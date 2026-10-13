@@ -1,6 +1,7 @@
-// qclone copies directories like rclone copy, but keeps reads flowing past
-// ones stuck on slow data, tunes how many reads fly by measuring them, shows a
-// rate that never reads zero while data is moving, and keeps errors out of the
+// qclone copies directories like rclone copy, but sorts the source's data into
+// fresh and slow as it reads, keeps fresh reads flowing while slow data grinds
+// in a lane of its own, measures the drive instead of assuming it, shows a rate
+// that never reads zero while data is moving, and keeps errors out of the
 // terminal.
 package main
 
@@ -33,21 +34,24 @@ Copies each SRC into the directory DST (created if missing):
 Files already at DST with the same size and modification time are skipped.
 
 flags:
-  -j, --readers N      flying reads at the start (default 4): reads not stuck on
-                       slow data. Raised 4 at a time while that makes them
-                       faster
+Each 32 MiB of a file is a region, judged by its reads: fresh while they come
+back within 50 ms, slow (quarantined) once one doesn't.
+
+  -j, --readers N      flying reads at the start (default 4): reads of fresh
+                       regions. Raised 4 at a time while that makes them faster
       --max-readers N  most flying reads, if you want a limit (default: none;
                        they're raised only while that pays; 256 at most)
-      --max-stuck N    a read in flight over 50 ms is stuck. Stuck reads get
-                       room of their own beside the flying reads, up to N of
-                       them, and no more are sent to slow files past that
-                       (default 16); 0: no room of their own, they take
-                       flying reads' places, as in rclone
+      --slow-lane N    keep N reads of slow regions going, measured otherwise
+                       (from 4, at most the queue length less 4); 0: none
+      --queue N        most reads in flight in all (default: measured at the
+                       start on fresh data, else 32)
+      --no-lanes       read every region alike, files in order, --readers at a
+                       time with one read each (rclone's way, to compare)
       --chunk SIZE     bytes per read, e.g. 256K, 4M (default 256K)
       --order ORDER    hash (default): by a hash of each path, among the next 1,024
                        files found, to mix old and new data; dfs: depth first,
                        names sorted; dirent: depth first, as the disk lists them
-      --fixed          don't tune: keep --readers as given
+      --fixed          don't tune: keep --readers and --slow-lane as given
       --errors FILE    where errors go (default: <timestamp>-qclone-errors.txt here)
       --rescue         install files that have unreadable spots, with zeros there
                        (each spot is listed in the error file; a later run
@@ -132,7 +136,9 @@ func run(args []string) (code int) {
 	fs.IntVar(&readers, "readers", 4, "")
 	fs.IntVar(&readers, "j", 4, "")
 	maxReaders := fs.Int("max-readers", 256, "")
-	maxStuck := fs.Int("max-stuck", 16, "")
+	slowLane := fs.Int("slow-lane", 4, "")
+	queue := fs.Int("queue", 0, "")
+	noLanes := fs.Bool("no-lanes", false, "")
 	orderFlag := fs.String("order", "hash", "")
 	chunkFlag := fs.String("chunk", "", "")
 	fixed := fs.Bool("fixed", false, "")
@@ -186,8 +192,11 @@ func run(args []string) (code int) {
 	if !set["readers"] && !set["j"] && readers > *maxReaders {
 		readers = *maxReaders // only the default was over the cap
 	}
-	if *maxStuck < 0 || *maxStuck > 256 {
-		return bad("--max-stuck must be 0 to 256")
+	if *slowLane < 0 || *slowLane > 256 {
+		return bad("--slow-lane must be 0 to 256")
+	}
+	if set["queue"] && (*queue < 1 || *queue > 256) {
+		return bad("--queue must be 1 to 256")
 	}
 	order, err := plan.ParseOrder(*orderFlag)
 	if err != nil {
@@ -254,7 +263,10 @@ func run(args []string) (code int) {
 	eng := copier.New(p, copier.Options{
 		Readers:      readers,
 		Tuner:        cfg,
-		MaxStuck:     *maxStuck,
+		SlowLane:     *slowLane,
+		SlowFixed:    set["slow-lane"],
+		Queue:        *queue,
+		NoLanes:      *noLanes,
 		Chunk:        chunk,
 		Fixed:        *fixed,
 		Cached:       *cached,
@@ -318,7 +330,7 @@ loop:
 			break loop
 		case <-tick.C:
 			s := eng.Snapshot()
-			hist.Record(s.Now, s.Rate, s.RateOK, s.Readers)
+			hist.Record(s.Now, s.Rate, s.RateOK, s.Reading)
 			if tui != nil {
 				tui.Draw(s)
 			}
@@ -328,7 +340,7 @@ loop:
 		}
 	}
 	final := eng.Snapshot()
-	hist.Record(final.Now, final.Rate, final.RateOK, final.Readers)
+	hist.Record(final.Now, final.Rate, final.RateOK, final.Reading)
 	if runErr != nil {
 		errLog.Log("start", p.Dst, runErr)
 		final = eng.Snapshot()
