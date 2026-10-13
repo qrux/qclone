@@ -21,20 +21,20 @@ type ErrorLog struct {
 	closed  bool
 }
 
-// DefaultErrorPath is <timestamp>-tclone-errors.txt in the current directory.
+// DefaultErrorPath is <timestamp>-qclone-errors.txt in the current directory.
 func DefaultErrorPath(now time.Time) string {
-	return now.Format("20060102-150405") + "-tclone-errors.txt"
+	return now.Format("20060102-150405") + "-qclone-errors.txt"
 }
 
 // NewErrorLog prepares (but does not create) the error file.
 func NewErrorLog(path string, args []string, started time.Time) *ErrorLog {
 	return &ErrorLog{
 		path:   path,
-		header: fmt.Sprintf("# tclone errors\n# started %s\n# command: tclone %s\n", started.Format(time.RFC3339), strings.Join(args, " ")),
+		header: fmt.Sprintf("# qclone errors\n# started %s\n# command: qclone %s\n", started.Format(time.RFC3339), strings.Join(args, " ")),
 	}
 }
 
-// Log records one error: what tclone was doing, on which path, and why.
+// Log records one error: what qclone was doing, on which path, and why.
 func (l *ErrorLog) Log(op, path string, err error) {
 	now := time.Now()
 	line := fmt.Sprintf("%s  %-6s %s: %v\n", now.Format(time.RFC3339), op, path, err)

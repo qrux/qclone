@@ -1,9 +1,9 @@
-// Package plan turns tclone's arguments into copy roots and walks them.
+// Package plan turns qclone's arguments into copy roots and walks them.
 //
 // Sources follow the rsync/cp convention:
 //
-//	tclone /path/to/source  /dst   ->  /dst/source/...   (the directory itself)
-//	tclone /path/to/source/ /dst   ->  /dst/...          (its contents)
+//	qclone /path/to/source  /dst   ->  /dst/source/...   (the directory itself)
+//	qclone /path/to/source/ /dst   ->  /dst/...          (its contents)
 //
 // A trailing "/." or a source of "." also means contents. A file source lands
 // in the destination under its own name. A symlink source without a trailing

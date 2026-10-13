@@ -1,15 +1,15 @@
-# tclone
+# qclone
 
 A local copy tool in the spirit of `rclone copy`, built for a failing SSD: a
 drive whose old, never-rewritten data needs so much error correction that some
 regions read at 2 MB/s while freshly written ones still read at 500 MB/s.
 
 ```
-tclone [flags] SRC [SRC...] DST
+qclone [flags] SRC [SRC...] DST
 ```
 
-- **Unix source convention.** `tclone /path/to/source DST` copies the directory
-  itself, to `DST/source/...`. `tclone /path/to/source/ DST` copies what's
+- **Unix source convention.** `qclone /path/to/source DST` copies the directory
+  itself, to `DST/source/...`. `qclone /path/to/source/ DST` copies what's
   inside it, to `DST/...`. A trailing `/.` or a source of `.` also means
   contents. A file source lands in `DST` under its own name; a symlink source
   is copied as a link, unless it has a trailing slash.
@@ -23,7 +23,7 @@ tclone [flags] SRC [SRC...] DST
   past it.
 - **Like `rclone copy`:** files already at the destination with the same size and
   modification time (within 1 s) are skipped, so a rerun picks up where the last
-  one stopped. Each file is written to a hidden `.tclone-*.part` file next to its
+  one stopped. Each file is written to a hidden `.qclone-*.part` file next to its
   destination, synced to disk, and only then renamed into place. A crash can't
   leave a file that looks complete (and would be skipped next time) but isn't.
   Modes, modification times, symlinks and empty directories are copied.
@@ -31,15 +31,15 @@ tclone [flags] SRC [SRC...] DST
   stop a rerun from retrying a file that failed in it. A symlink found where
   the destination needs a folder is never followed: that folder is skipped and
   logged.
-- **Errors never go to the terminal.** They go to `<timestamp>-tclone-errors.txt`
+- **Errors never go to the terminal.** They go to `<timestamp>-qclone-errors.txt`
   in the current directory (or `--errors FILE`). The file is created only when
   the first error happens. Exit status: 0 done, 1 some errors, 2 bad arguments,
   130 stopped.
 
 ## Interrupted copies resume; unreadable spots are mapped
 
-This works like ddrescue's mapfile. While a file copies, tclone keeps a
-`.tclone-<hash>.map` beside its `.part` file, recording which byte ranges are
+This works like ddrescue's mapfile. While a file copies, qclone keeps a
+`.qclone-<hash>.map` beside its `.part` file, recording which byte ranges are
 written. The map is updated every 2 seconds, only after an `fsync`, so it never
 claims more than the disk has. It is updated once more when the run stops.
 Rerun the same command after Ctrl-C, a crash or a `kill`, and each file carries
@@ -57,7 +57,7 @@ whatever is still unresolved is recorded as one coarser range.
   and map stay, and the error file lists each spot ("4096 bytes at 2105344").
   A rerun reads only those spots, since drives sometimes succeed on a later try.
 - **With `--rescue`**, the spots are filled with zeros and the file is installed.
-  A `.tclone-<hash>.bad` marker next to it lists the spots. The marker matters:
+  A `.qclone-<hash>.bad` marker next to it lists the spots. The marker matters:
   the file has the source's size and time, so without it every later run would
   skip it as unchanged, holes and all. With it, a later run clones the
   installed file (instant on APFS, a plain copy elsewhere), reads only the
@@ -73,7 +73,7 @@ back.
 
 A meter that counts bytes in the last second shows 0 B/s whenever one read
 takes longer than a second, and on a degraded drive single reads can take
-several. tclone measures from a baseline instead: the window reaches back at
+several. qclone measures from a baseline instead: the window reaches back at
 least 4 seconds, and further until it holds at least 4 completed reads. While
 a read is stuck the window keeps growing, so the rate decays toward the true
 average rather than dropping to zero. If nothing has landed for a while, the
@@ -88,7 +88,7 @@ memory followed by a stall while it flushes.
 
 ## It tunes itself
 
-tclone controls two things: how many reads are in flight (readers) and how big
+qclone controls two things: how many reads are in flight (readers) and how big
 each one is (chunk). Every file is cut into chunks in order, and the readers take
 chunks from wherever the queue is. So a big file is read by several readers at
 once, and small files are copied side by side, both under the same setting.
@@ -120,7 +120,7 @@ candidate's arm fell into a faster or slower region than the arms around it.
 - It remembers regions by speed, and the best setting found in each. On
   re-entering a slow region it jumps straight to what worked there before.
 - It reads the source disk's counters straight from IOKit (the same numbers
-  `iostat` prints, without spawning it). If the disk read much more than tclone
+  `iostat` prints, without spawning it). If the disk read much more than qclone
   did during an arm, something else was using it, and the arm doesn't count.
 
 Whether more reads in flight help a degraded drive depends on its controller.
@@ -155,7 +155,7 @@ and paths are never written to stdout, so a log of a run holds none.
     --max-readers N  most reads in flight the tuner may use (default 32)
     --chunk SIZE     bytes per read, e.g. 256K, 4M; fixes it (default: tuned, from 256K)
     --fixed          don't tune: keep --readers and --chunk as given
-    --errors FILE    where errors go (default: <timestamp>-tclone-errors.txt here)
+    --errors FILE    where errors go (default: <timestamp>-qclone-errors.txt here)
     --rescue         install files with unreadable spots, zeros there (listed in the
                      error file; a later run tries those spots again)
     --cached         read and write through the OS file cache
@@ -173,12 +173,12 @@ at once.
 ## Building and trying it
 
 ```
-make build       # build/tclone
+make build       # build/qclone
 make test        # vet and all tests, with the race detector
 make demo        # ~1 GB copy on a simulated degraded SSD, to watch the tuner work
 make demo-fixed  # the same copy at a fixed 4 readers x 1M, for comparison
 make demo-rescue # a failing drive: a plain pass, then a --rescue pass
-make install     # copy tclone to ~/bin
+make install     # copy qclone to ~/bin
 ```
 
 The simulated drive (`--simulate degraded`) treats any path component starting
@@ -191,7 +191,7 @@ failed read takes 200 ms, as on a real drive).
 ## Limits
 
 - Local to local only: no cloud remotes.
-- macOS first. The disk counters use IOKit; elsewhere tclone runs without them.
+- macOS first. The disk counters use IOKit; elsewhere qclone runs without them.
 - Not copied: extended attributes, ACLs, resource forks, Finder tags, file
   flags, ownership, hard links (each link becomes its own file), and symlink
   times.

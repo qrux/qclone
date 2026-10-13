@@ -1,3 +1,3 @@
-module tclone
+module qclone
 
 go 1.27.1

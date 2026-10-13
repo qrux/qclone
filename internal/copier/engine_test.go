@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"tclone/internal/plan"
-	"tclone/internal/sim"
-	"tclone/internal/tuner"
+	"qclone/internal/plan"
+	"qclone/internal/sim"
+	"qclone/internal/tuner"
 )
 
 type spec struct {
@@ -126,7 +126,7 @@ func sameTree(t *testing.T, src, dst string) int {
 func noPartials(t *testing.T, dst string) {
 	t.Helper()
 	filepath.WalkDir(dst, func(p string, d fs.DirEntry, err error) error {
-		if d != nil && strings.HasPrefix(d.Name(), ".tclone-") {
+		if d != nil && strings.HasPrefix(d.Name(), ".qclone-") {
 			t.Errorf("leftover partial file %s", p)
 		}
 		return nil
@@ -250,7 +250,7 @@ func TestErrorsGoToTheFileNotStderr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"locked.txt", "permission denied", "bad-sector.bin", "unreadable: ", "1048576 bytes", "kept for the next run", "named pipe", "# command: tclone", "# stopped"} {
+	for _, want := range []string{"locked.txt", "permission denied", "bad-sector.bin", "unreadable: ", "1048576 bytes", "kept for the next run", "named pipe", "# command: qclone", "# stopped"} {
 		if !bytes.Contains(log, []byte(want)) {
 			t.Errorf("error file lacks %q:\n%s", want, log)
 		}
@@ -266,14 +266,14 @@ func TestErrorsGoToTheFileNotStderr(t *testing.T) {
 	}
 	// The readable 2 MiB are kept for the next run.
 	if n := partials(dst); n != 2 {
-		t.Errorf("%d .tclone- files kept; want the part and its map", n)
+		t.Errorf("%d .qclone- files kept; want the part and its map", n)
 	}
 }
 
 func partials(dst string) int {
 	n := 0
 	filepath.WalkDir(dst, func(p string, d fs.DirEntry, err error) error {
-		if d != nil && strings.HasPrefix(d.Name(), ".tclone-") {
+		if d != nil && strings.HasPrefix(d.Name(), ".qclone-") {
 			n++
 		}
 		return nil
@@ -303,7 +303,7 @@ func TestCancelKeepsProgressAndResumes(t *testing.T) {
 		t.Fatal("canceled file was installed")
 	}
 	if n := partials(dst); n != 2 {
-		t.Fatalf("%d .tclone- files after cancel; want the part and its map", n)
+		t.Fatalf("%d .qclone- files after cancel; want the part and its map", n)
 	}
 	first := e.readBytes.Load()
 

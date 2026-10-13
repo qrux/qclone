@@ -1,11 +1,11 @@
 // Package sim pretends the source is a degraded SSD, for the demo and the
-// tests. It is never used unless asked for (tclone --simulate degraded).
+// tests. It is never used unless asked for (qclone --simulate degraded).
 //
 // The drive is modeled as one bandwidth server shared by all reads (what the
 // controller and its error-correction engine can deliver in total) plus a
 // floor on each read's own time (one read can only go so fast, however idle
 // the drive). So n reads in flight deliver about min(n * OpRate, Bandwidth):
-// more reads help until the drive saturates, which is the question tclone's
+// more reads help until the drive saturates, which is the question qclone's
 // tuner has to answer by measurement on a real drive.
 package sim
 
@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"tclone/internal/devstat"
+	"qclone/internal/devstat"
 )
 
 // Region is how one part of the drive behaves.
@@ -39,7 +39,7 @@ type Profile struct {
 	FailDelay time.Duration // how long a read that hits one takes to fail
 }
 
-// Degraded is the case tclone was built for: about 2 MB/s in old regions at rclone's
+// Degraded is the case qclone was built for: about 2 MB/s in old regions at rclone's
 // default four transfers, and 500 MB/s in recently written ones. Whether a real
 // drive's slow regions scale with more reads in flight is unknown; this one
 // does, up to 8 MB/s.

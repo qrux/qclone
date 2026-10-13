@@ -3,7 +3,7 @@ package copier
 // Rescue: resuming interrupted files and mapping unreadable regions.
 //
 // A file in progress has a hidden .part file beside its destination. Every two
-// seconds, and when a run stops, tclone records which byte ranges of the part
+// seconds, and when a run stops, qclone records which byte ranges of the part
 // are written (after an fsync, so the record never claims more than the disk
 // has) in a .map file next to it: the same idea as ddrescue's mapfile. A rerun
 // with the same source (same size and modification time) copies only what the

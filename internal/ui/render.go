@@ -7,8 +7,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"tclone/internal/copier"
-	"tclone/internal/tuner"
+	"qclone/internal/copier"
+	"qclone/internal/tuner"
 )
 
 // Frame is the fixed context of the display.
@@ -132,7 +132,7 @@ func clip(s string, w int) string {
 func (r *renderer) header() []*line {
 	s := r.s
 	l := r.nl()
-	l.add(inverse, " tclone ")
+	l.add(inverse, " qclone ")
 	if s.Rescue {
 		l.add(bred, " rescue")
 	}

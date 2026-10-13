@@ -1,14 +1,14 @@
-# tclone: every recurring command is a target here. Run `make` for the list.
+# qclone: every recurring command is a target here. Run `make` for the list.
 #
 # Recorded command lines use repo-relative paths and ~, never the home folder's name.
 #
 # Each target's output shows live on the terminal and is saved by the
 # project's log tool (log= in .treeflow/project-type; runlog) to
 # _logs/<target>-<UTC stamp>.log at the repo root; say kk when it finishes.
-# _logs must be the link into ~/jorp/tclone/logs (make -C ~/jorp proj-tclone).
+# _logs must be the link into ~/jorp/qclone/logs (make -C ~/jorp proj-qclone).
 #
 # Nothing here prints private paths: the tests and the demo use generated
-# files, and tclone itself never prints a file name to stdout (names go to
+# files, and qclone itself never prints a file name to stdout (names go to
 # the terminal's /dev/tty only).
 
 SHELL := /bin/bash
@@ -24,9 +24,9 @@ DEMO   := build/demo
 help:
 	@grep -E '^## ' $(firstword $(MAKEFILE_LIST)) | sed 's/^## /  /'
 
-## build: build build/tclone (and the demo-data generator)
+## build: build build/qclone (and the demo-data generator)
 build:
-	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/tclone ./cmd/tclone && go build -o build/mkdemo ./cmd/mkdemo && echo built build/tclone'
+	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/qclone ./cmd/qclone && go build -o build/mkdemo ./cmd/mkdemo && echo built build/qclone'
 
 ## test: go vet, then every test with the race detector (includes copies against a simulated
 ##   degraded SSD; about 40 seconds)
@@ -37,19 +37,19 @@ test:
 ##   display and the tuner at work on a pretend failing SSD (about a minute). The tuning
 ##   display draws on the terminal; the log gets a status line every 10 s.
 demo:
-	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/tclone ./cmd/tclone && go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/tclone --simulate degraded --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
+	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/qclone ./cmd/qclone && go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
 
 ## demo-fixed: the same copy at rclone's default of 4 readers, never tuned, to compare
 demo-fixed:
-	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/tclone ./cmd/tclone && go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/tclone --simulate degraded --fixed --readers 4 --chunk 1M --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
+	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/qclone ./cmd/qclone && go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst && build/qclone --simulate degraded --fixed --readers 4 --chunk 1M --errors $(DEMO)/errors.txt $(DEMO)/src/ $(DEMO)/dst'
 
 ## demo-rescue: the copy from a simulated failing SSD that has some unreadable sectors: once
 ##   plain (unreadable spots mapped to 4 KiB, those files kept unfinished), then again with
 ##   --rescue (only the spots are read again; the files are installed with zeros there). Both
 ##   runs end with status 1, as any run with unreadable spots does; that is expected here.
 demo-rescue:
-	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/tclone ./cmd/tclone && go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst-rescue && { build/tclone --simulate failing --errors $(DEMO)/errors-1.txt $(DEMO)/src/ $(DEMO)/dst-rescue || test $$? -eq 1; } && { build/tclone --simulate failing --rescue --errors $(DEMO)/errors-2.txt $(DEMO)/src/ $(DEMO)/dst-rescue || test $$? -eq 1; }'
+	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/qclone ./cmd/qclone && go build -o build/mkdemo ./cmd/mkdemo && build/mkdemo $(DEMO)/src && rm -rf $(DEMO)/dst-rescue && { build/qclone --simulate failing --errors $(DEMO)/errors-1.txt $(DEMO)/src/ $(DEMO)/dst-rescue || test $$? -eq 1; } && { build/qclone --simulate failing --rescue --errors $(DEMO)/errors-2.txt $(DEMO)/src/ $(DEMO)/dst-rescue || test $$? -eq 1; }'
 
-## install: build, then copy tclone to ~/bin/tclone
+## install: build, then copy qclone to ~/bin/qclone
 install:
-	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/tclone ./cmd/tclone && install -m 755 build/tclone ~/bin/tclone && echo installed ~/bin/tclone'
+	@cd $(ROOT) && $(LOGGED) sh -c 'go build -o build/qclone ./cmd/qclone && install -m 755 build/qclone ~/bin/qclone && echo installed ~/bin/qclone'

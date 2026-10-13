@@ -11,7 +11,7 @@ import (
 
 	"os"
 
-	"tclone/internal/copier"
+	"qclone/internal/copier"
 )
 
 // TUI redraws the whole screen in place, on the terminal's alternate screen,
@@ -140,7 +140,7 @@ func StatusLine(s copier.Snapshot) string {
 		speed = Rate(s.Rate) + " now  " + Rate(s.Avg) + " avg"
 	}
 	parts := []string{
-		"tclone " + Clock(s.Now.Sub(s.Start)),
+		"qclone " + Clock(s.Now.Sub(s.Start)),
 		Percent(frac),
 		Bytes(s.BytesDone) + " of " + Bytes(s.BytesTotal),
 		Count(s.FilesDone) + " of " + Count(s.FilesTotal) + " files",
@@ -163,13 +163,13 @@ func StatusLine(s copier.Snapshot) string {
 	return strings.Join(parts, "  ")
 }
 
-// Summary is what's printed when tclone ends: counts, rates and what the
+// Summary is what's printed when qclone ends: counts, rates and what the
 // tuner learned. No paths, except the error file's name.
 func Summary(s copier.Snapshot) []string {
 	el := Clock(s.Now.Sub(s.Start))
-	head := "tclone: done in " + el
+	head := "qclone: done in " + el
 	if s.Canceled {
-		head = "tclone: canceled after " + el
+		head = "qclone: canceled after " + el
 	}
 	files := Count(s.FilesDone) + " files"
 	if s.FilesDone == 1 {
@@ -194,7 +194,7 @@ func Summary(s copier.Snapshot) []string {
 	l1 += "."
 	out := []string{l1}
 	st := s.Tuner
-	l2 := fmt.Sprintf("tclone: ended at %s", settingText(st.Applied))
+	l2 := fmt.Sprintf("qclone: ended at %s", settingText(st.Applied))
 	if st.Mode == "fixed" {
 		l2 += " (fixed)"
 	} else {
@@ -209,10 +209,10 @@ func Summary(s copier.Snapshot) []string {
 	}
 	out = append(out, l2+".")
 	if s.BytesResumed > 0 {
-		out = append(out, fmt.Sprintf("tclone: %s carried over from an earlier run (partial or zero-filled copies), not read again.", Bytes(s.BytesResumed)))
+		out = append(out, fmt.Sprintf("qclone: %s carried over from an earlier run (partial or zero-filled copies), not read again.", Bytes(s.BytesResumed)))
 	}
 	if s.BadRanges > 0 {
-		l := fmt.Sprintf("tclone: %s unreadable in %s, in %s", Bytes(s.BadBytes), plural(int(s.BadRanges), "spot"), plural(int(s.BadFiles), "file"))
+		l := fmt.Sprintf("qclone: %s unreadable in %s, in %s", Bytes(s.BadBytes), plural(int(s.BadRanges), "spot"), plural(int(s.BadFiles), "file"))
 		if s.FilesRescued > 0 {
 			l += fmt.Sprintf("; %s installed with zeros there (a later run tries those spots again)", plural(int(s.FilesRescued), "file"))
 		}
@@ -223,9 +223,9 @@ func Summary(s copier.Snapshot) []string {
 	}
 	switch {
 	case s.Errors > 0:
-		out = append(out, fmt.Sprintf("tclone: %s errors, written to %s", Count(s.Errors), filepath.Base(s.ErrorFile)))
+		out = append(out, fmt.Sprintf("qclone: %s errors, written to %s", Count(s.Errors), filepath.Base(s.ErrorFile)))
 	default:
-		out = append(out, "tclone: no errors.")
+		out = append(out, "qclone: no errors.")
 	}
 	return out
 }

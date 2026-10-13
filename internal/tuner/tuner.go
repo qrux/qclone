@@ -60,7 +60,7 @@ type Config struct {
 	MaxRest    time.Duration
 }
 
-// DefaultConfig is what tclone uses.
+// DefaultConfig is what qclone uses.
 func DefaultConfig() Config {
 	return Config{
 		MinReaders: 1, MaxReaders: 32,
@@ -87,7 +87,7 @@ type Probe struct {
 	OldestInflight time.Duration // start of the oldest op still running; Now when none are
 	Starved        bool          // the queue can't keep the readers busy (scan behind, or near the end)
 	DevReadBytes   int64         // cumulative bytes the source device has read; < 0 when unknown
-	OurReadBytes   int64         // cumulative bytes tclone has read
+	OurReadBytes   int64         // cumulative bytes qclone has read
 }
 
 // Decision is one finished round, kept for the display.
@@ -174,7 +174,7 @@ func (w *window) rate() float64 {
 	return w.bytes / d
 }
 
-// noisy reports whether the source device read much more than tclone did
+// noisy reports whether the source device read much more than qclone did
 // during the window: someone else was using the disk, so the arm is not a
 // fair comparison.
 func (w *window) noisy() bool {

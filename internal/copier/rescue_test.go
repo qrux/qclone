@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"tclone/internal/plan"
-	"tclone/internal/sim"
+	"qclone/internal/plan"
+	"qclone/internal/sim"
 )
 
 func TestRanges(t *testing.T) {
@@ -133,7 +133,7 @@ func TestBadSectorsMappedThenRescuedThenPatched(t *testing.T) {
 		t.Fatal("run 2 left the .map behind after installing")
 	}
 
-	// 3. The drive reads the sectors now: the marker makes tclone re-read just
+	// 3. The drive reads the sectors now: the marker makes qclone re-read just
 	// those ranges, even though size and time match, and the file is whole.
 	e = runWith(t, args, opts(filepath.Join(base, "e3.txt")), nil)
 	s = e.Snapshot()

@@ -1,4 +1,4 @@
-// Package copier is tclone's engine.
+// Package copier is qclone's engine.
 //
 // One goroutine walks the sources and queues files (copying can start before
 // the walk ends). A dispatcher cuts each file, in order, into chunks of the
@@ -29,11 +29,11 @@ import (
 	"syscall"
 	"time"
 
-	"tclone/internal/devstat"
-	"tclone/internal/plan"
-	"tclone/internal/rate"
-	"tclone/internal/sim"
-	"tclone/internal/tuner"
+	"qclone/internal/devstat"
+	"qclone/internal/plan"
+	"qclone/internal/rate"
+	"qclone/internal/sim"
+	"qclone/internal/tuner"
 )
 
 // Options configure a run.
@@ -65,9 +65,9 @@ type DeviceView struct {
 	Info    devstat.Info
 	Rates   devstat.Rates
 	OK      bool          // rates are from two good samples
-	Idle    bool          // the disk did nothing tclone cares about for the whole history kept
+	Idle    bool          // the disk did nothing qclone cares about for the whole history kept
 	Window  time.Duration // what the rates are averaged over; when Idle, how long it has been idle
-	Errors  uint64        // read+write errors since tclone started
+	Errors  uint64        // read+write errors since qclone started
 	Retries uint64
 }
 
@@ -170,7 +170,7 @@ type devSample struct {
 // devHistory is how far back a disk's rate may reach to find movement.
 const devHistory = 120 * time.Second
 
-// moved reports whether the counters tclone cares about for this role changed.
+// moved reports whether the counters qclone cares about for this role changed.
 func (w *devWatch) moved(a, b devstat.Stats) bool {
 	switch w.role {
 	case "source":
@@ -482,12 +482,12 @@ func kindOf(m fs.FileMode) string {
 	return "special file"
 }
 
-// tmpBase is .tclone-<hash of the name> beside the destination; the part,
+// tmpBase is .qclone-<hash of the name> beside the destination; the part,
 // its map and a rescue marker are this plus .part, .map and .bad.
 func (e *Engine) tmpBase(dst string) string {
 	h := fnv.New64a()
 	io.WriteString(h, filepath.Base(dst))
-	return filepath.Join(filepath.Dir(dst), fmt.Sprintf(".tclone-%012x", h.Sum64()&0xffffffffffff))
+	return filepath.Join(filepath.Dir(dst), fmt.Sprintf(".qclone-%012x", h.Sum64()&0xffffffffffff))
 }
 
 // claimTmp picks the hidden file a copy is written to before it's renamed
@@ -532,7 +532,7 @@ func (e *Engine) copyLink(en plan.Entry) {
 	}
 	tmp, _ := e.claimTmp(en.Dst)
 	defer e.releaseTmp(tmp)
-	os.Remove(tmp) // a leftover of tclone's own, from an earlier run
+	os.Remove(tmp) // a leftover of qclone's own, from an earlier run
 	if err := os.Symlink(target, tmp); err != nil {
 		e.logErr("link", en.Dst, err)
 		return
@@ -654,7 +654,7 @@ func (e *Engine) open(f *file) error {
 		} else {
 			df, err = os.OpenFile(f.tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 			if errors.Is(err, fs.ErrExist) {
-				// Not in use this run (the claim says so): tclone's own leftover.
+				// Not in use this run (the claim says so): qclone's own leftover.
 				os.Remove(f.tmp)
 				df, err = os.OpenFile(f.tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 			}
@@ -856,7 +856,7 @@ func (e *Engine) discard(f *file) {
 		f.df.Close()
 	}
 	if f.tmp != "" {
-		os.Remove(f.tmp) // tclone's own partial file
+		os.Remove(f.tmp) // qclone's own partial file
 	}
 	if f.base != "" {
 		os.Remove(mapPath(f.base))

@@ -11,11 +11,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"tclone/internal/copier"
-	"tclone/internal/devstat"
-	"tclone/internal/plan"
-	"tclone/internal/sim"
-	"tclone/internal/tuner"
+	"qclone/internal/copier"
+	"qclone/internal/devstat"
+	"qclone/internal/plan"
+	"qclone/internal/sim"
+	"qclone/internal/tuner"
 )
 
 func TestFormatNeverPrintsZeroForPositive(t *testing.T) {
@@ -70,7 +70,7 @@ func fakeSnapshot(now time.Time) copier.Snapshot {
 			{Role: "source", OK: true, Info: devInfo("disk4", "Samsung SSD 840 EVO 1TB", "USB", "Solid State"), Rates: rates(7.9e6, 0, 31, 412*time.Millisecond, 12.9)},
 			{Role: "dest", OK: true, Info: devInfo("disk0", "APPLE SSD AP8192Z", "Apple Fabric", "Solid State"), Rates: rates(0, 7.9e6, 31, 0, 0.3)},
 		},
-		Errors: 2, ErrorFile: "20261012-141530-tclone-errors.txt", LastError: "read at byte 4194304 /Volumes/Old/photos/x.jpg: input/output error (3 tries)",
+		Errors: 2, ErrorFile: "20261012-141530-qclone-errors.txt", LastError: "read at byte 4194304 /Volumes/Old/photos/x.jpg: input/output error (3 tries)",
 	}
 }
 
@@ -127,7 +127,7 @@ func min(a, b int) int {
 }
 
 // Runs a real copy against the simulated degraded drive and checks every
-// frame. With TCLONE_FRAMES=FILE set, also writes the frames there as text.
+// frame. With QCLONE_FRAMES=FILE set, also writes the frames there as text.
 func TestFramesDuringSimulatedCopy(t *testing.T) {
 	base := t.TempDir()
 	src := filepath.Join(base, "src")
@@ -149,7 +149,7 @@ func TestFramesDuringSimulatedCopy(t *testing.T) {
 	done := make(chan struct{})
 	go func() { eng.Run(context.Background()); close(done) }()
 	var dump *os.File
-	if out := os.Getenv("TCLONE_FRAMES"); out != "" {
+	if out := os.Getenv("QCLONE_FRAMES"); out != "" {
 		dump, _ = os.Create(out)
 		defer dump.Close()
 	}

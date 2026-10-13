@@ -1,4 +1,4 @@
-// tclone copies directories like rclone copy, but tunes its own parallelism
+// qclone copies directories like rclone copy, but tunes its own parallelism
 // by experiment, shows a rate that never reads zero while data is moving, and
 // keeps errors out of the terminal.
 package main
@@ -17,18 +17,18 @@ import (
 	"syscall"
 	"time"
 
-	"tclone/internal/copier"
-	"tclone/internal/plan"
-	"tclone/internal/sim"
-	"tclone/internal/tuner"
-	"tclone/internal/ui"
+	"qclone/internal/copier"
+	"qclone/internal/plan"
+	"qclone/internal/sim"
+	"qclone/internal/tuner"
+	"qclone/internal/ui"
 )
 
-const usage = `usage: tclone [flags] SRC [SRC...] DST
+const usage = `usage: qclone [flags] SRC [SRC...] DST
 
 Copies each SRC into the directory DST (created if missing):
-  tclone /path/to/source  DST    copies the directory: DST/source/...
-  tclone /path/to/source/ DST    copies what's inside it: DST/...
+  qclone /path/to/source  DST    copies the directory: DST/source/...
+  qclone /path/to/source/ DST    copies what's inside it: DST/...
 Files already at DST with the same size and modification time are skipped.
 
 flags:
@@ -36,7 +36,7 @@ flags:
       --max-readers N  most reads in flight the tuner may use (default 32)
       --chunk SIZE     bytes per read, e.g. 256K, 4M; fixes it (default: tuned, from 256K)
       --fixed          don't tune: keep --readers and --chunk as given
-      --errors FILE    where errors go (default: <timestamp>-tclone-errors.txt here)
+      --errors FILE    where errors go (default: <timestamp>-qclone-errors.txt here)
       --rescue         install files that have unreadable spots, with zeros there
                        (each spot is listed in the error file; a later run
                        tries those spots again)
@@ -79,7 +79,7 @@ func parseSize(s string) (int, error) {
 
 func run(args []string) (code int) {
 	started := time.Now()
-	fs := flag.NewFlagSet("tclone", flag.ContinueOnError)
+	fs := flag.NewFlagSet("qclone", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var readers int
 	fs.IntVar(&readers, "readers", 4, "")
@@ -102,7 +102,7 @@ func run(args []string) (code int) {
 	rest := args
 	for len(rest) > 0 {
 		if err := fs.Parse(rest); err != nil {
-			fmt.Fprintf(os.Stderr, "tclone: %v\n\n%s", err, usage)
+			fmt.Fprintf(os.Stderr, "qclone: %v\n\n%s", err, usage)
 			return 2
 		}
 		rest = fs.Args()
@@ -121,7 +121,7 @@ func run(args []string) (code int) {
 		return 0
 	}
 	bad := func(format string, a ...interface{}) int {
-		fmt.Fprintf(os.Stderr, "tclone: "+format+"\n", a...)
+		fmt.Fprintf(os.Stderr, "qclone: "+format+"\n", a...)
 		return 2
 	}
 	if *maxReaders < 1 || *maxReaders > 256 {
@@ -162,7 +162,7 @@ func run(args []string) (code int) {
 	}
 	p, err := plan.Resolve(pos)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "tclone: %v\n\n%s", err, usage)
+		fmt.Fprintf(os.Stderr, "qclone: %v\n\n%s", err, usage)
 		return 2
 	}
 	if *errPath == "" {
@@ -213,9 +213,9 @@ func run(args []string) (code int) {
 			if tui != nil {
 				tui.Restore()
 			}
-			errLog.Log("panic", "tclone", fmt.Errorf("%v\n%s", r, debug.Stack()))
+			errLog.Log("panic", "qclone", fmt.Errorf("%v\n%s", r, debug.Stack()))
 			errLog.Close()
-			fmt.Printf("tclone: stopped by an internal error; details in %s\n", filepath.Base(errLog.Path()))
+			fmt.Printf("qclone: stopped by an internal error; details in %s\n", filepath.Base(errLog.Path()))
 			code = 1
 		}
 	}()
@@ -279,7 +279,7 @@ loop:
 		fmt.Println(l)
 	}
 	if w := errLog.WriteErr(); w != nil && final.Errors > 0 {
-		fmt.Printf("tclone: could not write the error file: %v\n", w)
+		fmt.Printf("qclone: could not write the error file: %v\n", w)
 	}
 	switch {
 	case final.Canceled:

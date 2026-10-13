@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"tclone/internal/sim"
+	"qclone/internal/sim"
 )
 
 // vsim drives a Tuner against the simulated drive in virtual time: readers

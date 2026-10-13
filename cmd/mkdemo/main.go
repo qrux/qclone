@@ -1,5 +1,5 @@
 // mkdemo writes the demo tree that `make demo` copies with
-// `tclone --simulate degraded`: old photos (whose names put them in the
+// `qclone --simulate degraded`: old photos (whose names put them in the
 // simulated drive's slow, heavily error-corrected regions), two big videos
 // with slow stretches inside them, and many small recent files.
 //
