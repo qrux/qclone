@@ -81,6 +81,9 @@ say "sha256 $sha; builds; says '$got'"
 
 # --- 3. the tap
 tap=build/homebrew-tap
+if [ -d "$tap/.git" ] && [ "$(git -C "$tap" remote get-url origin)" != "$tap_url" ]; then
+  rm -rf "$tap"   # this script's clone of some other tap (a test run's): start over
+fi
 if [ -d "$tap/.git" ]; then
   git -C "$tap" fetch -q origin
   if git -C "$tap" rev-parse -q --verify origin/main >/dev/null; then
