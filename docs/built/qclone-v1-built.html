@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qclone v1 as built</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#5f6368; --bg:#ffffff; --code:#f4f4f6; --rule:#d9d9de; --accent:#0a5bd3; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e8ea; --muted:#a1a1a8; --bg:#161618; --code:#232327; --rule:#38383d; --accent:#6aa5ff; } }
+  body { font: 16px/1.55 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg); max-width: 50rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.8rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.3rem; margin-top: 2.2rem; border-bottom: 1px solid var(--rule); padding-bottom: .2rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.4rem; }
+  .meta { color: var(--muted); margin-top: 0; }
+  code, pre { font: 14px/1.45 ui-monospace, Menlo, monospace; background: var(--code); border-radius: 4px; }
+  code { padding: 0 .25em; }
+  pre { padding: .7rem .9rem; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: 15px; }
+  th, td { border: 1px solid var(--rule); padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  th { background: var(--code); }
+  .note { border-left: 3px solid var(--accent); padding: .2rem .8rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>qclone v1, as built</h1>
+<p class="meta">2026-10-13 &middot; repo <code>~/proj/qrux/qclone</code> (github.com/qrux/qclone) &middot; released as 0.1.0 &middot; written by the Claude Code session that built it</p>
+
+<p class="note">There is no spec for this revision. qclone was built from Q's request in chat on 2026-10-12, so this
+document records the decisions as they were made in that conversation rather than against a written spec. A spec
+for revision 2 should start from here.</p>
+
+<h2>1. What was asked</h2>
+<ul>
+  <li>An rclone-like copier (first named <code>tclone</code>) that tries hard never to show a transfer rate of 0&nbsp;B/s,
+      unless there are errors.</li>
+  <li>It works out by itself, using iostat or similar, whether more parallel copies are faster, and adjusts while
+      running. The case to handle: a degraded SSD whose old, never-rewritten regions read at about 2&nbsp;MB/s while fresh
+      regions read at 500&nbsp;MB/s.</li>
+  <li>Errors go to a file, by default <code>&lt;timestamp&gt;-tclone-errors.txt</code>, never to stderr. Redrawing the
+      whole window is fine.</li>
+  <li>Several source directories. <code>/path/to/source</code> copies the directory itself; <code>/path/to/source/</code>
+      copies its contents.</li>
+  <li>A display as nice as possible, with ASCII-art progress bars.</li>
+  <li>Later in the session: a rescue mode (interrupted copies resume, unreadable spots are mapped), the rename to qclone,
+      an Apache-2.0 license, publishing under the qrux GitHub account, and a Homebrew tap.</li>
+</ul>
+
+<h2>2. What was built</h2>
+<p>A single Go binary, <code>qclone</code>, macOS first: <code>qclone [flags] SRC [SRC...] DST</code>.</p>
+<table>
+  <tr><th>Package</th><th>Does</th></tr>
+  <tr><td><code>cmd/qclone</code></td><td>Flags (allowed anywhere, as with rclone), signals, display selection, summary, exit status, <code>--version</code>.</td></tr>
+  <tr><td><code>internal/plan</code></td><td>Turns the arguments into roots by the trailing-slash rule; refuses overlaps by file identity; walks the trees.</td></tr>
+  <tr><td><code>internal/copier</code></td><td>The engine: scanner, chunk dispatcher, a gate of readers whose size the tuner sets, temporary <code>.part</code> files renamed into place, the error file, resume and rescue (<code>rescue.go</code>).</td></tr>
+  <tr><td><code>internal/tuner</code></td><td>Chooses readers in flight and chunk size by experiment (section 3.3).</td></tr>
+  <tr><td><code>internal/rate</code></td><td>The rate meter that never reads zero once data has moved.</td></tr>
+  <tr><td><code>internal/devstat</code></td><td>Per-disk counters straight from IOKit (the numbers iostat prints), for the source and destination disks.</td></tr>
+  <tr><td><code>internal/ui</code></td><td>The full-screen ASCII display, plain status lines, the summary.</td></tr>
+  <tr><td><code>internal/sim</code></td><td>The simulated degraded drive (<code>--simulate degraded|failing</code>) used by the demos and tests.</td></tr>
+  <tr><td><code>cmd/mkdemo</code></td><td>Writes the roughly 1&nbsp;GB demo tree.</td></tr>
+  <tr><td><code>packaging/homebrew</code></td><td>The formula template, the tap's README, and <code>release.sh</code>.</td></tr>
+  <tr><td><code>probe/licenses</code></td><td>The measurement behind the license choice.</td></tr>
+</table>
+
+<h2>3. Choices made, and why</h2>
+
+<h3>3.1 Scope and conventions</h3>
+<ul>
+  <li><b>Go</b>, standard library only (no third-party modules), with cgo for IOKit and <code>clonefile</code>.</li>
+  <li><b>Local to local only.</b> No cloud remotes, which is why the Homebrew description says "local rclone".</li>
+  <li><b>Source rule as asked</b>, plus the rsync details: <code>src/.</code> and <code>.</code> also mean contents; a file
+      lands under its own name; a symlink source is copied as a link unless it has a trailing slash.</li>
+  <li><b>Like <code>rclone copy</code>:</b> files at the destination with the same size and modification time (within 1&nbsp;s)
+      are skipped, so a rerun picks up where it stopped. Modes, modification times, symlinks and empty directories are
+      copied. Directories get their modes at the end, so a read-only source folder doesn't stop a rerun from writing.</li>
+  <li><b>Overlap checks compare files by identity, not by name</b>: a destination inside a source, a contents source
+      inside its destination, a file onto itself. Name checks were fooled by APFS ignoring letter case. Duplicate
+      destination files across sources are compared with case folded when the destination ignores case.</li>
+  <li><b>Atomic installs.</b> Each file is written to a hidden <code>.qclone-&lt;hash&gt;.part</code> beside its
+      destination, fsynced, then renamed, so a crash never leaves a complete-looking file that is really partial.</li>
+  <li><b>No OS file cache by default</b> (<code>F_NOCACHE</code>, <code>--cached</code> to turn it off). The rate shown is then
+      the disk's, and the reads in flight are exactly the tuner's setting, with no read-ahead added.</li>
+  <li><b>Errors:</b> <code>&lt;timestamp&gt;-qclone-errors.txt</code> in the current folder (<code>--errors FILE</code> to
+      move it), created only when the first error happens. Only bad arguments go to stderr. Exit status: 0 done,
+      1 some errors, 2 bad arguments, 130 stopped.</li>
+  <li><b>Paths never reach stdout.</b> The display goes to the terminal, or to <code>/dev/tty</code> when stdout is a pipe;
+      stdout then gets path-free status lines every 10&nbsp;s. That keeps runlog logs free of file names.</li>
+</ul>
+
+<h3>3.2 The rate never reads zero</h3>
+<ul>
+  <li>The rate is measured from a baseline: the window covers at least 4&nbsp;s, and stretches back further until it holds
+      4 completed reads. While a read is stuck the window keeps growing, so the rate decays toward the true average
+      instead of dropping to zero. After 5&nbsp;s with nothing landing, the display adds "no read finished for Ns".</li>
+  <li>The per-disk rates work the same way, reaching back up to 2 minutes. A disk with no activity at all shows
+      "idle for Ns", never "0 B/s".</li>
+  <li>Before the first byte the display says "starting", and a file still waiting on its first read says "wait Ns".</li>
+  <li>The peak shown is never below the average, which fixed a 0&nbsp;B/s peak in runs shorter than the 100&nbsp;ms sample.</li>
+</ul>
+
+<h3>3.3 The tuner</h3>
+<ul>
+  <li><b>Two dimensions:</b> readers in flight, and chunk size. Defaults: start at 4 readers (rclone's default) and
+      256&nbsp;KiB chunks; readers range from 1 to 32 (<code>--max-readers</code> up to 256), since 32 is the SATA queue-depth
+      limit; chunks range from 128&nbsp;KiB to 8&nbsp;MiB.</li>
+  <li><b>Rounds of five arms, A C A C A</b> (A the current setting, C a candidate). Each C is scored against the mean of
+      the A arms on either side, which cancels steady drift in the drive's speed.</li>
+  <li><b>Fluid measurement:</b> each finished read+write is spread over its own start-to-end interval, so arm boundaries
+      are exact even when one read takes seconds.</li>
+  <li><b>Two-generation settle.</b> Measuring starts only after the reads begun under the old setting, and those begun
+      while they were running, have finished. With one generation, a deeper queue measured 15&ndash;20% better than it
+      was. Found and fixed in simulation.</li>
+  <li><b>Thresholds:</b> more readers must gain 5%; fewer readers may cost up to 2%. A bigger chunk must gain 3%; a smaller
+      one may cost up to 2%. The chunk grows only while reads take under 0.5&nbsp;s.</li>
+  <li><b>Speed-ups:</b> readers double per step at the start and after entering a slower region, until a step stops
+      paying. A round ends early after A C A when the difference passes 25%.</li>
+  <li><b>Rounds thrown out:</b> when the A arms disagree by more than 2.5&times; (a region change); when a result claims
+      more than the change could cause (twice the readers can at most double throughput); when the disk read much more
+      than qclone did (something else was using it, per IOKit).</li>
+  <li><b>Region memory:</b> the best setting is kept per speed level, and the tuner jumps back to it when it re-enters a
+      region of that speed.</li>
+  <li>Tuning pauses when less than about 10&nbsp;s of work is left, or the scan can't keep up.</li>
+</ul>
+
+<h3>3.4 Display</h3>
+<ul>
+  <li>Full screen on the alternate screen; the last frame stays in scrollback at the end. Redrawn 4 times a second in a
+      single write, using a synchronized update.</li>
+  <li>ASCII only for the drawing. Bars look like <code>[#####&gt;....]</code>. The speed chart is log-scale with round-number
+      rows (a 1-2-5 ladder) and colored by slowness, with the reader count charted beneath it. File names are shown as
+      they are, with control characters replaced.</li>
+  <li>Sections: total, speed chart, the tuner's live arms and last verdict, the source and destination disks (model,
+      interface, rates, time per read, queue depth, the disk's own error counters), per-file bars, errors.</li>
+  <li>Sizes and rates in decimal units (kB, MB, GB), as Finder uses. Works from 20 columns up, without panics.</li>
+</ul>
+
+<h3>3.5 Rescue</h3>
+<ul>
+  <li><b>Resume:</b> a <code>.qclone-&lt;hash&gt;.map</code> beside each part records the byte ranges written. It's saved
+      every 2&nbsp;s after an fsync, and when a run stops. A rerun with the same source size and time copies only what's
+      missing.</li>
+  <li><b>Unreadable spots</b> are bisected down to 4&nbsp;KiB after 3 tries, with at most 64 failed reads per chunk.</li>
+  <li><b>Without <code>--rescue</code>,</b> such a file isn't installed; its part and map are kept, and a rerun retries just the
+      spots.</li>
+  <li><b>With <code>--rescue</code>,</b> the spots are zero-filled, the file is installed, and a <code>.bad</code> marker is
+      written first. Later runs clone the installed file (instant on APFS) and re-read only those spots.</li>
+  <li>Every spot is listed by byte offset in the error file. The display and summary show counts only.</li>
+</ul>
+
+<h3>3.6 Naming, ownership, license, publishing</h3>
+<ul>
+  <li><b>Renamed tclone to qclone.</b> Of the names checked, it had the fewest collisions: only an unrelated npm package.
+      "qlone" is a commercial 3D-scanner app.</li>
+  <li><b>Author identity:</b> the repo's own git identity is Qrux &lt;797788+qrux@users.noreply.github.com&gt;. Every commit
+      was rewritten to it, and no history with Q's legal name remains.</li>
+  <li><b>License: Apache-2.0</b>, <code>Copyright &copy; 2026 Qrux</code>. <code>NOTICE</code> says "qclone was created by Qrux",
+      and section 4(d) makes every distribution carry it. Chosen after <code>make license-probe</code>: among Homebrew's
+      Go tools, 42.8% are MIT and 38.0% Apache-2.0.</li>
+  <li><b>Pushes go through the <code>github-qrux</code> SSH alias</b>, so they authenticate as qrux.</li>
+  <li><b>Builds use <code>-trimpath -ldflags "-s -w"</code></b>, so binaries carry no local paths.</li>
+  <li><b>Homebrew: a formula in the tap <code>qrux/homebrew-tap</code></b>, built from the tagged source on the user's Mac,
+      so no signing or notarization is needed. Description: "Prettier local rclone: cleaner syntax, adaptive
+      parallelism, degraded-SSD rescue".</li>
+</ul>
+
+<h2>4. Where the build departs from the request</h2>
+<ul>
+  <li><b>"iostat or whatever":</b> the counters come straight from IOKit's <code>IOBlockStorageDriver</code> statistics,
+      the same numbers iostat reads, without starting a process ten times a second.</li>
+  <li><b>"Always something positive":</b> before any data has moved there is nothing to measure, so the display says
+      "starting". A disk that has done nothing at all says "idle".</li>
+  <li><b>Errors and stderr:</b> bad arguments still go to stderr, since there's no run yet and nowhere else to say it.</li>
+</ul>
+
+<h2>5. What was verified, and how</h2>
+<ul>
+  <li><b><code>make test</code></b>: <code>go vet</code>, then every test with the race detector, all passing. Q's logged run passed
+      after the rename. The tests cover:
+    <ul>
+      <li>the rate meter through a ten-minute stall;</li>
+      <li>the tuner in virtual time on scalable, non-scalable, fast, alternating, overhead-bound and noisy drives;</li>
+      <li>argument rules and refusals;</li>
+      <li>byte-exact tree copies with modes, times and links;</li>
+      <li>errors only in the error file, with nothing on stderr;</li>
+      <li>cancel, resume (no byte read twice) and rescue (exact spots, zero-fill, re-read after recovery);</li>
+      <li>map truthfulness mid-copy;</li>
+      <li>frames at every width from 20 to 79 columns.</li>
+    </ul>
+  </li>
+  <li><b>Demos on the simulated degraded drive:</b> 972&nbsp;MB, 362 files. Tuned: 52&nbsp;s at an average of 18.8&nbsp;MB/s.
+      Fixed at 4 readers &times; 1&nbsp;MiB (rclone's shape): 2:31 at 6.46&nbsp;MB/s. Copies byte-identical (<code>diff -r</code>).
+      The 2.9&times; depends on the simulator's assumption that slow regions speed up with more reads in flight.</li>
+  <li><b>Rescue demo on <code>--simulate failing</code>:</b> 21 spots, 86&nbsp;kB, in 9 files. The plain pass kept the parts;
+      the <code>--rescue</code> pass read only the spots and installed the files with zeros; a pass on the recovered
+      drive read 86&nbsp;kB and ended byte-identical.</li>
+  <li><b>A code review by a separate agent</b> found 13 defects, all fixed with regression tests. Among them: a panic on
+      narrow terminals; the case-blind copy-into-itself recursion; case-colliding temp files; read-only folders
+      blocking retries; stale chunk sizes in tuner tests; mixing wall-clock and monotonic time.</li>
+  <li><b>Release 0.1.0:</b> tag <code>v0.1.0</code> on <code>0f0321b</code>, tagged by Qrux. The tarball's SHA-256 is
+      <code>676fc78024cd3e550514fae6d36c054d2d5710905d5425763f69d535279a07d2</code>, the same on repeated downloads; built
+      from it, the binary reports <code>qclone 0.1.0</code>.</li>
+  <li><b>Homebrew:</b> <code>make brew-check</code> tapped <code>qrux/tap</code>, passed <code>brew audit --strict --online</code>, built
+      from source, and passed the formula's test. <code>qclone</code> on the PATH is Homebrew's 0.1.0.</li>
+</ul>
+
+<h2>6. Releasing a new version</h2>
+<ol>
+  <li>Commit the changes and push them:
+<pre>git -C ~/proj/qrux/qclone push</pre></li>
+  <li>Release, with the new version number:
+<pre>make -C ~/proj/qrux/qclone release VERSION=0.2.0</pre>
+      It refuses to run if <code>main</code> has uncommitted changes or differs from GitHub's. Otherwise it:
+      <ul>
+        <li>runs <code>go vet</code> and the tests;</li>
+        <li>tags <code>v0.2.0</code> and pushes the tag;</li>
+        <li>downloads GitHub's tarball for the tag and builds it the way the formula does (<code>qclone --version</code> must
+            print <code>qclone 0.2.0</code>);</li>
+        <li>writes <code>Formula/qclone.rb</code> with the tarball's checksum into the tap, commits as Qrux, and pushes.</li>
+      </ul>
+      <code>DRY_RUN=1</code> does everything except the pushes. Run against a tag that's already on GitHub, it republishes
+      that tag's formula.</li>
+  <li>Optionally, check the result the way a user gets it. This installs qclone from the tap through Homebrew:
+<pre>make -C ~/proj/qrux/qclone brew-check</pre></li>
+</ol>
+<p>Users get the new version with <code>brew upgrade</code>. To change the formula itself (its description, dependencies or
+test), edit <code>packaging/homebrew/qclone.rb.in</code> in qclone, not the tap. The next release writes it.</p>
+
+<h2>7. Still open</h2>
+<ul>
+  <li><b>Never yet run on the real degraded drive.</b> Whether its slow regions speed up with more reads in flight is up
+      to its controller. A USB bridge without command queuing limits it to one read at a time, and the disk panel's queue
+      figure will show that.</li>
+  <li><b>Not copied:</b> extended attributes, ACLs, resource forks, Finder tags, file flags, ownership, hard links (each
+      becomes its own file), symlink times.</li>
+  <li><b>No cloud remotes.</b></li>
+  <li><b>Copyright in AI-written code is uncertain in the US.</b> Q directed the work and Claude wrote most of the code.
+      Worth a lawyer's view before relying on the copyright, for example in a sale.</li>
+  <li><b>Published 2026-10-13, public from the first push.</b> The US one-year window for patenting anything in it runs
+      from then; outside the US it's already closed.</li>
+  <li><b>Prebuilt binaries</b>, if ever distributed, should carry Go's BSD notice. The tap builds from source, so it doesn't
+      need it.</li>
+  <li><b>Every commit message carries a Claude co-author line</b>, so GitHub shows Claude as a co-author.</li>
+  <li><b>homebrew-core</b> (a plain <code>brew install qclone</code>) needs notability: about 30 forks, 30 watchers or 75 stars.</li>
+  <li><b>runlog flags Go package names</b> such as <code>qclone/internal/ui</code> as paths, so every test log ends with a
+      <code>WARNING</code> footer.</li>
+  <li><b>The tuner's chunk-size measurement</b> showed a residual bias of about 4% toward bigger chunks in the simulator,
+      where queues fill slowly. Growth is limited to reads under 0.5&nbsp;s; real drives may differ.</li>
+</ul>
+
+</body>
+</html>
